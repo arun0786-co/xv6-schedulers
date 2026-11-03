@@ -1,44 +1,41 @@
 #include "kernel/types.h"
-#include "kernel/stat.h"
+#include "kernel/fcntl.h"
 #include "user/user.h"
 
+// Checks getreadcount(): read 100 bytes from a file and see the count grow.
 int
-main(int argc, char *argv[])
+main(void)
 {
-  int initial_count, final_count;
-  int fd;
-  char buffer[100];
-  int bytes_read;
+  char buf[100];
+  uint before, after, grew;
+  int fd, n;
 
-  // Get initial read count
-  initial_count = getreadcount();
-  printf("Initial read count: %d bytes\n", initial_count);
+  before = getreadcount();
+  printf("read count before: %u\n", before);
 
-  // Open a file for reading
-  fd = open("README", 0);
-  if(fd < 0) {
-    printf("Failed to open README file\n");
+  if((fd = open("/README", O_RDONLY)) < 0){
+    fprintf(2, "readcount: cannot open /README\n");
+    exit(1);
+  }
+  n = read(fd, buf, sizeof(buf));
+  close(fd);
+  if(n != sizeof(buf)){
+    fprintf(2, "readcount: read returned %d, expected %d\n", n, (int)sizeof(buf));
     exit(1);
   }
 
-  // Read 100 bytes from the file
-  bytes_read = read(fd, buffer, 100);
-  printf("Read %d bytes from README\n", bytes_read);
+  after = getreadcount();
+  printf("read count after:  %u\n", after);
 
-  // Close the file
-  close(fd);
-
-  // Get final read count
-  final_count = getreadcount();
-  printf("Final read count: %d bytes\n", final_count);
-
-  // Verify the increase
-  if(final_count == initial_count + bytes_read) {
-    printf("SUCCESS: Read count increased by %d bytes as expected\n", bytes_read);
-  } else {
-    printf("ERROR: Expected increase of %d bytes, but got %d bytes\n", 
-           bytes_read, final_count - initial_count);
+  // Unsigned subtraction gives the right difference even when the count
+  // wrapped around to 0 in between.
+  grew = after - before;
+  if(grew < (uint)n){
+    printf("FAIL: the count grew by %u after reading %d bytes\n", grew, n);
+    exit(1);
   }
-
+  printf("OK: the count grew by %u after reading %d bytes\n", grew, n);
+  if(grew > (uint)n)
+    printf("(other processes read %u bytes in the meantime)\n", grew - n);
   exit(0);
 }
