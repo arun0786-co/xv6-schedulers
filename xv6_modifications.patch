@@ -1,8 +1,8 @@
 diff --git a/Makefile b/Makefile
-index 2d5f9e4..ad7934d 100644
+index 2d5f9e4..7801ca6 100644
 --- a/Makefile
 +++ b/Makefile
-@@ -81,6 +81,28 @@ ifneq ($(shell $(CC) -dumpspecs 2>/dev/null | grep -e '[^f]nopie'),)
+@@ -81,6 +81,32 @@ ifneq ($(shell $(CC) -dumpspecs 2>/dev/null | grep -e '[^f]nopie'),)
  CFLAGS += -fno-pie -nopie
  endif
  
@@ -13,6 +13,10 @@ index 2d5f9e4..ad7934d 100644
 +endif
 +CFLAGS += -DSCHEDULER_$(SCHEDULER)
 +
++# CFS prints the run queue before every decision; make CFSLOG=0 turns it off.
++CFSLOG ?= 1
++CFLAGS += -DCFSLOG=$(CFSLOG)
++
 +# Start the read counter close to the top, to test its wrap-around:
 +# make qemu READCOUNT_START=4294967200
 +ifdef READCOUNT_START
@@ -22,7 +26,7 @@ index 2d5f9e4..ad7934d 100644
 +# Make cannot see a change in compiler flags, so the kernel options are kept
 +# in a file that is rewritten only when they change, and every kernel object
 +# depends on that file.
-+KOPTS = $(SCHEDULER) $(READCOUNT_START)
++KOPTS = $(SCHEDULER) $(CFSLOG) $(READCOUNT_START)
 +$K/kernel.options: FORCE
 +	@echo '$(KOPTS)' | cmp -s - $@ || echo '$(KOPTS)' > $@
 +$(OBJS): $K/kernel.options
@@ -31,17 +35,18 @@ index 2d5f9e4..ad7934d 100644
  LDFLAGS = -z max-page-size=4096
  
  $K/kernel: $(OBJS) $K/kernel.ld
-@@ -142,6 +164,9 @@ UPROGS=\
+@@ -142,6 +168,10 @@ UPROGS=\
  	$U/_logstress\
  	$U/_forphan\
  	$U/_dorphan\
 +	$U/_readcount\
 +	$U/_readrace\
 +	$U/_schedulertest\
++	$U/_nicetest\
  
  fs.img: mkfs/mkfs README $(UPROGS)
  	mkfs/mkfs fs.img README $(UPROGS)
-@@ -151,7 +176,7 @@ fs.img: mkfs/mkfs README $(UPROGS)
+@@ -151,7 +181,7 @@ fs.img: mkfs/mkfs README $(UPROGS)
  clean: 
  	rm -f *.tex *.dvi *.idx *.aux *.log *.ind *.ilg \
  	*/*.o */*.d */*.asm */*.sym \
@@ -79,15 +84,17 @@ index 122d9ca..31faf4b 100644
  // swtch.S
  void            swtch(struct context*, struct context*);
 diff --git a/kernel/proc.c b/kernel/proc.c
-index 9d6cf3f..2c17a43 100644
+index 9d6cf3f..0c124f9 100644
 --- a/kernel/proc.c
 +++ b/kernel/proc.c
-@@ -15,9 +15,40 @@ struct proc *initproc;
+@@ -15,9 +15,67 @@ struct proc *initproc;
  int nextpid = 1;
  struct spinlock pid_lock;
  
-+// Global time counter for scheduling
-+uint64 global_time = 0;
++#ifdef SCHEDULER_CFS
++#define TARGET_LATENCY 48  // ticks in which every runnable process gets a turn
++#define MIN_SLICE 3        // shortest turn, in ticks
++#define VRT_TICK 1000      // vruntime added by one tick at nice 0
 +
 +// CFS weight of each nice value from -20 to 19: 1024 / 1.25^nice, rounded
 +// the way the Linux kernel rounds it, so nice 0 is 1024, -20 is 88761 and
@@ -103,9 +110,14 @@ index 9d6cf3f..2c17a43 100644
 +  /*  15 */    36,    29,    23,    18,    15,
 +};
 +
-+uint64 calculate_weight(int nice) {
-+  return nice_weight[nice + 20];
-+}
++// The run queue: every RUNNABLE process, in ascending order of vruntime.
++// Lock order: p->lock, then rq.lock.
++struct {
++  struct spinlock lock;
++  struct proc *head;
++  int n;
++} rq;
++#endif
 +
  extern void forkret(void);
  static void freeproc(struct proc *p);
@@ -120,27 +132,62 @@ index 9d6cf3f..2c17a43 100644
 +  return __atomic_load_n(&ticks, __ATOMIC_RELAXED);
 +}
 +
++// Mark p RUNNABLE. Under CFS it also goes into the run queue, behind every
++// process with a lower or equal vruntime, so equal ones take turns.
++// Caller must hold p->lock.
++static void
++setrunnable(struct proc *p)
++{
++  p->state = RUNNABLE;
++#ifdef SCHEDULER_CFS
++  struct proc **pp;
++
++  acquire(&rq.lock);
++  for(pp = &rq.head; *pp && (*pp)->vruntime <= p->vruntime; pp = &(*pp)->rqnext)
++    ;
++  p->rqnext = *pp;
++  *pp = p;
++  rq.n++;
++  release(&rq.lock);
++#endif
++}
++
  extern char trampoline[]; // trampoline.S
  
  // helps ensure that wakeups of wait()ing
-@@ -146,6 +177,16 @@ found:
+@@ -51,6 +109,9 @@ procinit(void)
+   
+   initlock(&pid_lock, "nextpid");
+   initlock(&wait_lock, "wait_lock");
++#ifdef SCHEDULER_CFS
++  initlock(&rq.lock, "rq");
++#endif
+   for(p = proc; p < &proc[NPROC]; p++) {
+       initlock(&p->lock, "proc");
+       p->state = UNUSED;
+@@ -146,6 +207,12 @@ found:
    p->context.ra = (uint64)forkret;
    p->context.sp = p->kstack + PGSIZE;
  
 +  p->ctime = now();
 +  p->rtime = 0;
 +  p->etime = 0;
-+
-+  // Initialize scheduling fields
-+  p->nice = 0;  // Default nice value
++  p->nice = 0;
 +  p->vruntime = 0;
-+  p->weight = calculate_weight(0);  // Calculate weight for nice=0
-+  p->last_run_time = 0;
 +
    return p;
  }
  
-@@ -256,10 +297,15 @@ growproc(int n)
+@@ -226,7 +293,7 @@ userinit(void)
+   
+   p->cwd = namei("/");
+ 
+-  p->state = RUNNABLE;
++  setrunnable(p);
+ 
+   release(&p->lock);
+ }
+@@ -256,10 +323,15 @@ growproc(int n)
  int
  kfork(void)
  {
@@ -157,16 +204,24 @@ index 9d6cf3f..2c17a43 100644
    // Allocate process.
    if((np = allocproc()) == 0){
      return -1;
-@@ -286,6 +332,8 @@ kfork(void)
+@@ -286,6 +358,7 @@ kfork(void)
    np->cwd = idup(p->cwd);
  
    safestrcpy(np->name, p->name, sizeof(p->name));
 +  np->nice = nice;
-+  np->weight = calculate_weight(nice);
  
    pid = np->pid;
  
-@@ -354,6 +402,7 @@ kexit(int status)
+@@ -296,7 +369,7 @@ kfork(void)
+   release(&wait_lock);
+ 
+   acquire(&np->lock);
+-  np->state = RUNNABLE;
++  setrunnable(np);
+   release(&np->lock);
+ 
+   return pid;
+@@ -354,6 +427,7 @@ kexit(int status)
  
    p->xstate = status;
    p->state = ZOMBIE;
@@ -174,7 +229,7 @@ index 9d6cf3f..2c17a43 100644
  
    release(&wait_lock);
  
-@@ -364,8 +413,10 @@ kexit(int status)
+@@ -364,8 +438,10 @@ kexit(int status)
  
  // Wait for a child process to exit and return its pid.
  // Return -1 if this process has no children.
@@ -186,7 +241,7 @@ index 9d6cf3f..2c17a43 100644
  {
    struct proc *pp;
    int havekids, pid;
-@@ -391,6 +442,10 @@ kwait(uint64 addr)
+@@ -391,6 +467,10 @@ kwait(uint64 addr)
              release(&wait_lock);
              return -1;
            }
@@ -197,7 +252,7 @@ index 9d6cf3f..2c17a43 100644
            freeproc(pp);
            release(&pp->lock);
            release(&wait_lock);
-@@ -411,6 +466,54 @@ kwait(uint64 addr)
+@@ -411,6 +491,101 @@ kwait(uint64 addr)
    }
  }
  
@@ -236,6 +291,44 @@ index 9d6cf3f..2c17a43 100644
 +}
 +#endif
 +
++#ifdef SCHEDULER_CFS
++// CFS: take the process with the smallest vruntime, which is the head of
++// the run queue, and give it an equal share of TARGET_LATENCY. Returns the
++// process with its lock held, or 0 if none is RUNNABLE.
++static struct proc*
++pick(void)
++{
++  struct proc *p;
++  int n;
++
++  acquire(&rq.lock);
++  if((p = rq.head) == 0){
++    release(&rq.lock);
++    return 0;
++  }
++#if CFSLOG
++  printf("[Scheduler Tick]\n");
++  for(struct proc *q = p; q; q = q->rqnext)
++    printf("PID: %d | vRuntime: %lu\n", q->pid, q->vruntime);
++  printf("--> Scheduling PID %d (lowest vRuntime)\n", p->pid);
++#endif
++  n = rq.n;
++  rq.head = p->rqnext;
++  rq.n--;
++  release(&rq.lock);
++
++  // Off the queue, p stays RUNNABLE and no other CPU can choose it. If it
++  // has just yielded on another CPU, this waits until that CPU has
++  // switched away from it.
++  acquire(&p->lock);
++  p->slice = TARGET_LATENCY / n;
++  if(p->slice < MIN_SLICE)
++    p->slice = MIN_SLICE;
++  p->slice_used = 0;
++  return p;
++}
++#endif
++
 +// On a timer interrupt: should the running process give up the CPU?
 +int
 +preempt(void)
@@ -243,6 +336,15 @@ index 9d6cf3f..2c17a43 100644
 +#if defined(SCHEDULER_FCFS)
 +  // FCFS keeps a process on the CPU until it exits or sleeps.
 +  return 0;
++#elif defined(SCHEDULER_CFS)
++  // CFS lets a process use up its slice.
++  struct proc *p = myproc();
++  int over;
++
++  acquire(&p->lock);
++  over = p->slice_used >= p->slice;
++  release(&p->lock);
++  return over;
 +#else
 +  // Round robin switches on every tick.
 +  return 1;
@@ -252,11 +354,11 @@ index 9d6cf3f..2c17a43 100644
  // Per-CPU process scheduler.
  // Each CPU calls scheduler() after setting itself up.
  // Scheduler never returns.  It loops, doing:
-@@ -434,6 +537,84 @@ scheduler(void)
+@@ -434,6 +609,21 @@ scheduler(void)
      intr_on();
      intr_off();
  
-+#ifdef SCHEDULER_FCFS
++#if defined(SCHEDULER_FCFS) || defined(SCHEDULER_CFS)
 +    if((p = pick()) == 0){
 +      asm volatile("wfi");
 +      continue;
@@ -269,75 +371,12 @@ index 9d6cf3f..2c17a43 100644
 +    c->proc = 0;
 +    release(&p->lock);
 +
-+#elif defined(SCHEDULER_CFS)
-+    // Completely Fair Scheduler
-+    struct proc *selected = 0;
-+    uint64 min_vruntime = ~0ULL;  // Maximum uint64 value
-+    int runnable_count = 0;
-+    
-+    // Count runnable processes and find minimum vruntime
-+    for(p = proc; p < &proc[NPROC]; p++) {
-+      acquire(&p->lock);
-+      if(p->state == RUNNABLE) {
-+        runnable_count++;
-+        if(p->vruntime < min_vruntime) {
-+          min_vruntime = p->vruntime;
-+        }
-+      }
-+      release(&p->lock);
-+    }
-+    
-+    // Find process with minimum vruntime
-+    for(p = proc; p < &proc[NPROC]; p++) {
-+      acquire(&p->lock);
-+      if(p->state == RUNNABLE && p->vruntime == min_vruntime) {
-+        selected = p;
-+        break;
-+      }
-+      release(&p->lock);
-+    }
-+    
-+    if(selected) {
-+      // Calculate time slice: target_latency / number_of_runnable_processes
-+      // Minimum time slice of 3 ticks
-+      uint64 time_slice = 48;  // target_latency
-+      if(runnable_count > 0) {
-+        time_slice = time_slice / runnable_count;
-+        if(time_slice < 3) time_slice = 3;
-+      }
-+      
-+      // Log scheduling decision
-+      printf("[Scheduler Tick]\n");
-+      for(p = proc; p < &proc[NPROC]; p++) {
-+        acquire(&p->lock);
-+        if(p->state == RUNNABLE) {
-+          printf("PID: %d | vRuntime: %ld\n", p->pid, p->vruntime);
-+        }
-+        release(&p->lock);
-+      }
-+      printf("--> Scheduling PID %d (lowest vRuntime)\n", selected->pid);
-+      
-+      selected->state = RUNNING;
-+      selected->last_run_time = global_time;
-+      c->proc = selected;
-+      swtch(&c->context, &selected->context);
-+      
-+      // Update vruntime after process runs
-+      uint64 run_time = global_time - selected->last_run_time;
-+      selected->vruntime += (run_time * 1024) / selected->weight;
-+      
-+      c->proc = 0;
-+      release(&selected->lock);
-+    } else {
-+      asm volatile("wfi");
-+    }
-+
 +#else
 +    // Default Round Robin scheduler
      int found = 0;
      for(p = proc; p < &proc[NPROC]; p++) {
        acquire(&p->lock);
-@@ -456,9 +637,24 @@ scheduler(void)
+@@ -456,9 +646,30 @@ scheduler(void)
        // nothing to run; stop running on this core until an interrupt.
        asm volatile("wfi");
      }
@@ -356,13 +395,36 @@ index 9d6cf3f..2c17a43 100644
 +    return;
 +  acquire(&p->lock);
 +  p->rtime++;
++#ifdef SCHEDULER_CFS
++  // Weighted by nice: a tick at nice 0 adds VRT_TICK, and a heavier
++  // process adds less, so it stays near the front of the queue longer.
++  p->vruntime += VRT_TICK * 1024 / nice_weight[p->nice + 20];
++  p->slice_used++;
++#endif
 +  release(&p->lock);
 +}
 +
  // Switch to scheduler.  Must hold only p->lock
  // and have changed proc->state. Saves and restores
  // intena because intena is a property of this
-@@ -583,6 +779,27 @@ wakeup(void *chan)
+@@ -492,7 +703,7 @@ yield(void)
+ {
+   struct proc *p = myproc();
+   acquire(&p->lock);
+-  p->state = RUNNABLE;
++  setrunnable(p);
+   sched();
+   release(&p->lock);
+ }
+@@ -576,13 +787,33 @@ wakeup(void *chan)
+     if(p != myproc()){
+       acquire(&p->lock);
+       if(p->state == SLEEPING && p->chan == chan) {
+-        p->state = RUNNABLE;
++        setrunnable(p);
+       }
+       release(&p->lock);
+     }
    }
  }
  
@@ -378,7 +440,6 @@ index 9d6cf3f..2c17a43 100644
 +    acquire(&p->lock);
 +    if(p->pid == pid && p->state != UNUSED){
 +      p->nice = nice;
-+      p->weight = calculate_weight(nice);
 +      release(&p->lock);
 +      return 0;
 +    }
@@ -390,31 +451,40 @@ index 9d6cf3f..2c17a43 100644
  // Kill the process with the given pid.
  // The victim won't exit until it tries to return
  // to user space (see usertrap() in trap.c).
+@@ -597,7 +828,7 @@ kkill(int pid)
+       p->killed = 1;
+       if(p->state == SLEEPING){
+         // Wake process from sleep().
+-        p->state = RUNNABLE;
++        setrunnable(p);
+       }
+       release(&p->lock);
+       return 0;
 diff --git a/kernel/proc.h b/kernel/proc.h
-index d021857..1e21173 100644
+index d021857..9d89f9b 100644
 --- a/kernel/proc.h
 +++ b/kernel/proc.h
-@@ -91,6 +91,9 @@ struct proc {
+@@ -91,10 +91,20 @@ struct proc {
    int killed;                  // If non-zero, have been killed
    int xstate;                  // Exit status to be returned to parent's wait
    int pid;                     // Process ID
 +  uint ctime;                  // Tick the process was created
 +  uint rtime;                  // Ticks it has spent running
 +  uint etime;                  // Tick it exited
++  int nice;                    // -20 (most CPU time) to 19 (least)
++  uint64 vruntime;             // CFS: weighted run time, in 1/1000 tick
++  int slice;                   // CFS: ticks this turn on the CPU may last
++  int slice_used;              // CFS: ticks used of this turn
  
    // wait_lock must be held when using this:
    struct proc *parent;         // Parent process
-@@ -104,4 +107,10 @@ struct proc {
-   struct file *ofile[NOFILE];  // Open files
-   struct inode *cwd;           // Current directory
-   char name[16];               // Process name (debugging)
-+  
-+  // Scheduling fields
-+  int nice;                    // Nice value for CFS (-20 to 19)
-+  uint64 vruntime;             // Virtual runtime for CFS
-+  uint64 weight;               // Process weight for CFS
-+  uint64 last_run_time;        // Last time process ran
- };
+ 
++  // rq.lock (in proc.c) must be held when using this:
++  struct proc *rqnext;         // CFS: next process in the run queue
++
+   // these are private to the process, so p->lock need not be held.
+   uint64 kstack;               // Virtual address of kernel stack
+   uint64 sz;                   // Size of process memory (bytes)
 diff --git a/kernel/syscall.c b/kernel/syscall.c
 index 076d965..1cd1d18 100644
 --- a/kernel/syscall.c
@@ -554,7 +624,7 @@ index 3044d00..7fc22c9 100644
  sys_kill(void)
  {
 diff --git a/kernel/trap.c b/kernel/trap.c
-index a41cd69..41f7773 100644
+index a41cd69..1a55fca 100644
 --- a/kernel/trap.c
 +++ b/kernel/trap.c
 @@ -80,8 +80,9 @@ usertrap(void)
@@ -581,18 +651,97 @@ index a41cd69..41f7773 100644
      yield();
  
    // the yield() may have caused some traps to occur,
-@@ -170,6 +172,11 @@ clockintr()
+@@ -170,6 +172,7 @@ clockintr()
      wakeup(&ticks);
      release(&tickslock);
    }
 +  proctick();
-+
-+  // Increment global time for scheduling
-+  extern uint64 global_time;
-+  global_time++;
  
    // ask for the next timer interrupt. this also clears
    // the interrupt request. 1000000 is about a tenth
+diff --git a/user/nicetest.c b/user/nicetest.c
+new file mode 100644
+index 0000000..744655f
+--- /dev/null
++++ b/user/nicetest.c
+@@ -0,0 +1,77 @@
++#include "kernel/types.h"
++#include "user/user.h"
++
++// usage: nicetest [nice...]
++// For CFS on one CPU: make qemu SCHEDULER=CFS CFSLOG=0 CPUS=1
++// Starts one CPU-bound child per nice value (default 0 and 5). They all spin
++// until the same tick and then exit, so each child's share of the CPU time
++// should match its share of the total weight.
++#define TICKS 100
++#define MAXCHILD 8
++
++// the kernel's weight table, nice -20 to 19
++static const int weight[40] = {
++  88761, 71755, 56483, 46273, 36291, 29154, 23254, 18705, 14949, 11916,
++   9548,  7620,  6100,  4904,  3906,  3121,  2501,  1991,  1586,  1277,
++   1024,   820,   655,   526,   423,   335,   272,   215,   172,   137,
++    110,    87,    70,    56,    45,    36,    29,    23,    18,    15,
++};
++
++int
++main(int argc, char *argv[])
++{
++  int nice[MAXCHILD] = {0, 5}, pids[MAXCHILD], rtime[MAXCHILD];
++  int n = 2, end, pid, wtime, rt, ok = 1;
++  int totalw = 0, totalr = 0;
++
++  if(argc > 1){
++    n = argc - 1;
++    if(n > MAXCHILD){
++      fprintf(2, "nicetest: at most %d children\n", MAXCHILD);
++      exit(1);
++    }
++    for(int i = 0; i < n; i++){
++      char *s = argv[i + 1];
++      nice[i] = *s == '-' ? -atoi(s + 1) : atoi(s);
++      if(nice[i] < -20 || nice[i] > 19){
++        fprintf(2, "nicetest: nice must be -20 to 19\n");
++        exit(1);
++      }
++    }
++  }
++
++  end = uptime() + TICKS;
++  for(int i = 0; i < n; i++){
++    if((pid = fork()) == 0){
++      if(setnice(getpid(), nice[i]) < 0)
++        exit(1);
++      while(uptime() < end)
++        for(volatile int k = 0; k < 100000; k++)
++          ;
++      exit(0);
++    }
++    pids[i] = pid;
++  }
++  for(int left = n; left > 0; left--){
++    if((pid = waitx(0, &wtime, &rt)) < 0)
++      break;
++    for(int i = 0; i < n; i++)
++      if(pids[i] == pid)
++        rtime[i] = rt;
++  }
++
++  for(int i = 0; i < n; i++){
++    totalw += weight[nice[i] + 20];
++    totalr += rtime[i];
++  }
++  for(int i = 0; i < n; i++){
++    int want = 100 * weight[nice[i] + 20] / totalw;
++    int got = totalr ? 100 * rtime[i] / totalr : 0;
++    printf("nice %d: weight %d, expected %d%%, got %d%% (%d ticks)\n",
++           nice[i], weight[nice[i] + 20], want, got, rtime[i]);
++    if(got < want - 5 || got > want + 5)
++      ok = 0;
++  }
++  printf(ok ? "nicetest: OK\n" : "nicetest: FAIL\n");
++  exit(ok ? 0 : 1);
++}
 diff --git a/user/readcount.c b/user/readcount.c
 new file mode 100644
 index 0000000..6e2665b
