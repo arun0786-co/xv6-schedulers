@@ -51,10 +51,18 @@ index 2d5f9e4..ad7934d 100644
          $U/usys.S \
  	$(UPROGS)
 diff --git a/kernel/defs.h b/kernel/defs.h
-index 122d9ca..9276214 100644
+index 122d9ca..31faf4b 100644
 --- a/kernel/defs.h
 +++ b/kernel/defs.h
-@@ -95,12 +95,14 @@ void            scheduler(void) __attribute__((noreturn));
+@@ -86,6 +86,7 @@ void            proc_mapstacks(pagetable_t);
+ pagetable_t     proc_pagetable(struct proc *);
+ void            proc_freepagetable(pagetable_t, uint64);
+ int             kkill(int);
++int             ksetnice(int, int);
+ int             killed(struct proc*);
+ void            setkilled(struct proc*);
+ struct cpu*     mycpu(void);
+@@ -95,12 +96,14 @@ void            scheduler(void) __attribute__((noreturn));
  void            sched(void);
  void            sleep(void*, struct spinlock*);
  void            userinit(void);
@@ -71,68 +79,32 @@ index 122d9ca..9276214 100644
  // swtch.S
  void            swtch(struct context*, struct context*);
 diff --git a/kernel/proc.c b/kernel/proc.c
-index 9d6cf3f..5440303 100644
+index 9d6cf3f..2c17a43 100644
 --- a/kernel/proc.c
 +++ b/kernel/proc.c
-@@ -15,9 +15,76 @@ struct proc *initproc;
+@@ -15,9 +15,40 @@ struct proc *initproc;
  int nextpid = 1;
  struct spinlock pid_lock;
  
 +// Global time counter for scheduling
 +uint64 global_time = 0;
 +
-+// CFS helper functions
++// CFS weight of each nice value from -20 to 19: 1024 / 1.25^nice, rounded
++// the way the Linux kernel rounds it, so nice 0 is 1024, -20 is 88761 and
++// 19 is 15. One nice level apart is about 10% more or less CPU time.
++static const int nice_weight[40] = {
++  /* -20 */ 88761, 71755, 56483, 46273, 36291,
++  /* -15 */ 29154, 23254, 18705, 14949, 11916,
++  /* -10 */  9548,  7620,  6100,  4904,  3906,
++  /*  -5 */  3121,  2501,  1991,  1586,  1277,
++  /*   0 */  1024,   820,   655,   526,   423,
++  /*   5 */   335,   272,   215,   172,   137,
++  /*  10 */   110,    87,    70,    56,    45,
++  /*  15 */    36,    29,    23,    18,    15,
++};
++
 +uint64 calculate_weight(int nice) {
-+  // weight = 1024 / (1.25 ^ nice)
-+  // For nice values: -20 to 19
-+  if (nice < -20) nice = -20;
-+  if (nice > 19) nice = 19;
-+  
-+  // Precomputed weights for common nice values
-+  static uint64 weights[] = {
-+    88761,  // nice -20
-+    72089,  // nice -19
-+    58506,  // nice -18
-+    47491,  // nice -17
-+    38550,  // nice -16
-+    31288,  // nice -15
-+    25400,  // nice -14
-+    20626,  // nice -13
-+    16744,  // nice -12
-+    13584,  // nice -11
-+    11028,  // nice -10
-+    8944,   // nice -9
-+    7260,   // nice -8
-+    5891,   // nice -7
-+    4778,   // nice -6
-+    3880,   // nice -5
-+    3147,   // nice -4
-+    2554,   // nice -3
-+    2072,   // nice -2
-+    1681,   // nice -1
-+    1365,   // nice 0
-+    1108,   // nice 1
-+    899,    // nice 2
-+    730,    // nice 3
-+    592,    // nice 4
-+    481,    // nice 5
-+    390,    // nice 6
-+    317,    // nice 7
-+    257,    // nice 8
-+    208,    // nice 9
-+    169,    // nice 10
-+    137,    // nice 11
-+    111,    // nice 12
-+    90,     // nice 13
-+    73,     // nice 14
-+    59,     // nice 15
-+    48,     // nice 16
-+    39,     // nice 17
-+    32,     // nice 18
-+    26,     // nice 19
-+  };
-+  
-+  return weights[nice + 20];
++  return nice_weight[nice + 20];
 +}
 +
  extern void forkret(void);
@@ -151,7 +123,7 @@ index 9d6cf3f..5440303 100644
  extern char trampoline[]; // trampoline.S
  
  // helps ensure that wakeups of wait()ing
-@@ -146,6 +213,16 @@ found:
+@@ -146,6 +177,16 @@ found:
    p->context.ra = (uint64)forkret;
    p->context.sp = p->kstack + PGSIZE;
  
@@ -168,7 +140,33 @@ index 9d6cf3f..5440303 100644
    return p;
  }
  
-@@ -354,6 +431,7 @@ kexit(int status)
+@@ -256,10 +297,15 @@ growproc(int n)
+ int
+ kfork(void)
+ {
+-  int i, pid;
++  int i, pid, nice;
+   struct proc *np;
+   struct proc *p = myproc();
+ 
++  // The child inherits the parent's nice value, as in Unix.
++  acquire(&p->lock);
++  nice = p->nice;
++  release(&p->lock);
++
+   // Allocate process.
+   if((np = allocproc()) == 0){
+     return -1;
+@@ -286,6 +332,8 @@ kfork(void)
+   np->cwd = idup(p->cwd);
+ 
+   safestrcpy(np->name, p->name, sizeof(p->name));
++  np->nice = nice;
++  np->weight = calculate_weight(nice);
+ 
+   pid = np->pid;
+ 
+@@ -354,6 +402,7 @@ kexit(int status)
  
    p->xstate = status;
    p->state = ZOMBIE;
@@ -176,7 +174,7 @@ index 9d6cf3f..5440303 100644
  
    release(&wait_lock);
  
-@@ -364,8 +442,10 @@ kexit(int status)
+@@ -364,8 +413,10 @@ kexit(int status)
  
  // Wait for a child process to exit and return its pid.
  // Return -1 if this process has no children.
@@ -188,7 +186,7 @@ index 9d6cf3f..5440303 100644
  {
    struct proc *pp;
    int havekids, pid;
-@@ -391,6 +471,10 @@ kwait(uint64 addr)
+@@ -391,6 +442,10 @@ kwait(uint64 addr)
              release(&wait_lock);
              return -1;
            }
@@ -199,7 +197,7 @@ index 9d6cf3f..5440303 100644
            freeproc(pp);
            release(&pp->lock);
            release(&wait_lock);
-@@ -411,6 +495,54 @@ kwait(uint64 addr)
+@@ -411,6 +466,54 @@ kwait(uint64 addr)
    }
  }
  
@@ -254,7 +252,7 @@ index 9d6cf3f..5440303 100644
  // Per-CPU process scheduler.
  // Each CPU calls scheduler() after setting itself up.
  // Scheduler never returns.  It loops, doing:
-@@ -434,6 +566,84 @@ scheduler(void)
+@@ -434,6 +537,84 @@ scheduler(void)
      intr_on();
      intr_off();
  
@@ -339,7 +337,7 @@ index 9d6cf3f..5440303 100644
      int found = 0;
      for(p = proc; p < &proc[NPROC]; p++) {
        acquire(&p->lock);
-@@ -456,9 +666,24 @@ scheduler(void)
+@@ -456,9 +637,24 @@ scheduler(void)
        // nothing to run; stop running on this core until an interrupt.
        asm volatile("wfi");
      }
@@ -364,6 +362,34 @@ index 9d6cf3f..5440303 100644
  // Switch to scheduler.  Must hold only p->lock
  // and have changed proc->state. Saves and restores
  // intena because intena is a property of this
+@@ -583,6 +779,27 @@ wakeup(void *chan)
+   }
+ }
+ 
++// Set the nice value of the process with the given pid.
++int
++ksetnice(int pid, int nice)
++{
++  struct proc *p;
++
++  if(nice < -20 || nice > 19)
++    return -1;
++  for(p = proc; p < &proc[NPROC]; p++){
++    acquire(&p->lock);
++    if(p->pid == pid && p->state != UNUSED){
++      p->nice = nice;
++      p->weight = calculate_weight(nice);
++      release(&p->lock);
++      return 0;
++    }
++    release(&p->lock);
++  }
++  return -1;
++}
++
+ // Kill the process with the given pid.
+ // The victim won't exit until it tries to return
+ // to user space (see usertrap() in trap.c).
 diff --git a/kernel/proc.h b/kernel/proc.h
 index d021857..1e21173 100644
 --- a/kernel/proc.h
@@ -390,37 +416,40 @@ index d021857..1e21173 100644
 +  uint64 last_run_time;        // Last time process ran
  };
 diff --git a/kernel/syscall.c b/kernel/syscall.c
-index 076d965..b1da869 100644
+index 076d965..1cd1d18 100644
 --- a/kernel/syscall.c
 +++ b/kernel/syscall.c
-@@ -101,6 +101,8 @@ extern uint64 sys_unlink(void);
+@@ -101,6 +101,9 @@ extern uint64 sys_unlink(void);
  extern uint64 sys_link(void);
  extern uint64 sys_mkdir(void);
  extern uint64 sys_close(void);
 +extern uint64 sys_getreadcount(void);
 +extern uint64 sys_waitx(void);
++extern uint64 sys_setnice(void);
  
  // An array mapping syscall numbers from syscall.h
  // to the function that handles the system call.
-@@ -126,6 +128,8 @@ static uint64 (*syscalls[])(void) = {
+@@ -126,6 +129,9 @@ static uint64 (*syscalls[])(void) = {
  [SYS_link]    sys_link,
  [SYS_mkdir]   sys_mkdir,
  [SYS_close]   sys_close,
 +[SYS_getreadcount] sys_getreadcount,
 +[SYS_waitx]   sys_waitx,
++[SYS_setnice] sys_setnice,
  };
  
  void
 diff --git a/kernel/syscall.h b/kernel/syscall.h
-index 3dd926d..c273021 100644
+index 3dd926d..5e56fb7 100644
 --- a/kernel/syscall.h
 +++ b/kernel/syscall.h
-@@ -20,3 +20,5 @@
+@@ -20,3 +20,6 @@
  #define SYS_link   19
  #define SYS_mkdir  20
  #define SYS_close  21
 +#define SYS_getreadcount 22
 +#define SYS_waitx  23
++#define SYS_setnice 24
 diff --git a/kernel/sysfile.c b/kernel/sysfile.c
 index d8234ce..4c24446 100644
 --- a/kernel/sysfile.c
@@ -470,7 +499,7 @@ index d8234ce..4c24446 100644
 +  return __atomic_load_n(&readcount, __ATOMIC_RELAXED);
 +}
 diff --git a/kernel/sysproc.c b/kernel/sysproc.c
-index 3044d00..8733b15 100644
+index 3044d00..7fc22c9 100644
 --- a/kernel/sysproc.c
 +++ b/kernel/sysproc.c
 @@ -33,7 +33,29 @@ sys_wait(void)
@@ -504,6 +533,26 @@ index 3044d00..8733b15 100644
  }
  
  uint64
+@@ -84,6 +106,19 @@ sys_pause(void)
+   return 0;
+ }
+ 
++// setnice(pid, nice): set a process's nice value, -20 (most CPU time) to
++// 19 (least), which sets its CFS weight. Returns 0, or -1 if there is no
++// such process or the value is out of range.
++uint64
++sys_setnice(void)
++{
++  int pid, nice;
++
++  argint(0, &pid);
++  argint(1, &nice);
++  return ksetnice(pid, nice);
++}
++
+ uint64
+ sys_kill(void)
+ {
 diff --git a/kernel/trap.c b/kernel/trap.c
 index a41cd69..41f7773 100644
 --- a/kernel/trap.c
@@ -709,25 +758,27 @@ index 0000000..db426fc
 +  exit(0);
 +}
 diff --git a/user/user.h b/user/user.h
-index ac84de9..d297c98 100644
+index ac84de9..35b4315 100644
 --- a/user/user.h
 +++ b/user/user.h
-@@ -24,6 +24,8 @@ int getpid(void);
+@@ -24,6 +24,9 @@ int getpid(void);
  char* sys_sbrk(int,int);
  int pause(int);
  int uptime(void);
 +uint getreadcount(void);
 +int waitx(int*, int*, int*);
++int setnice(int, int);
  
  // ulib.c
  int stat(const char*, struct stat*);
 diff --git a/user/usys.pl b/user/usys.pl
-index c5d4c3a..576759d 100755
+index c5d4c3a..d165431 100755
 --- a/user/usys.pl
 +++ b/user/usys.pl
-@@ -42,3 +42,5 @@ entry("getpid");
+@@ -42,3 +42,6 @@ entry("getpid");
  entry("sbrk");
  entry("pause");
  entry("uptime");
 +entry("getreadcount");
 +entry("waitx");
++entry("setnice");
