@@ -84,7 +84,7 @@ index 122d9ca..31faf4b 100644
  // swtch.S
  void            swtch(struct context*, struct context*);
 diff --git a/kernel/proc.c b/kernel/proc.c
-index 9d6cf3f..94dd7fa 100644
+index 9d6cf3f..4d355be 100644
 --- a/kernel/proc.c
 +++ b/kernel/proc.c
 @@ -15,9 +15,67 @@ struct proc *initproc;
@@ -241,18 +241,23 @@ index 9d6cf3f..94dd7fa 100644
  {
    struct proc *pp;
    int havekids, pid;
-@@ -391,6 +467,10 @@ kwait(uint64 addr)
+@@ -391,6 +467,15 @@ kwait(uint64 addr)
              release(&wait_lock);
              return -1;
            }
 +          if(rtime)
 +            *rtime = pp->rtime;
-+          if(wtime)
-+            *wtime = pp->etime - pp->ctime - pp->rtime;
++          if(wtime){
++            // ticks counts CPU 0's timer, but rtime is charged by each
++            // CPU's own timer, so on several CPUs rtime can exceed the
++            // time alive by one tick.
++            uint alive = pp->etime - pp->ctime;
++            *wtime = alive > pp->rtime ? alive - pp->rtime : 0;
++          }
            freeproc(pp);
            release(&pp->lock);
            release(&wait_lock);
-@@ -411,6 +491,101 @@ kwait(uint64 addr)
+@@ -411,6 +496,101 @@ kwait(uint64 addr)
    }
  }
  
@@ -354,7 +359,7 @@ index 9d6cf3f..94dd7fa 100644
  // Per-CPU process scheduler.
  // Each CPU calls scheduler() after setting itself up.
  // Scheduler never returns.  It loops, doing:
-@@ -434,6 +609,21 @@ scheduler(void)
+@@ -434,6 +614,21 @@ scheduler(void)
      intr_on();
      intr_off();
  
@@ -376,7 +381,7 @@ index 9d6cf3f..94dd7fa 100644
      int found = 0;
      for(p = proc; p < &proc[NPROC]; p++) {
        acquire(&p->lock);
-@@ -456,9 +646,30 @@ scheduler(void)
+@@ -456,9 +651,30 @@ scheduler(void)
        // nothing to run; stop running on this core until an interrupt.
        asm volatile("wfi");
      }
@@ -407,7 +412,7 @@ index 9d6cf3f..94dd7fa 100644
  // Switch to scheduler.  Must hold only p->lock
  // and have changed proc->state. Saves and restores
  // intena because intena is a property of this
-@@ -492,7 +703,7 @@ yield(void)
+@@ -492,7 +708,7 @@ yield(void)
  {
    struct proc *p = myproc();
    acquire(&p->lock);
@@ -416,7 +421,7 @@ index 9d6cf3f..94dd7fa 100644
    sched();
    release(&p->lock);
  }
-@@ -576,13 +787,33 @@ wakeup(void *chan)
+@@ -576,13 +792,33 @@ wakeup(void *chan)
      if(p != myproc()){
        acquire(&p->lock);
        if(p->state == SLEEPING && p->chan == chan) {
@@ -451,7 +456,7 @@ index 9d6cf3f..94dd7fa 100644
  // Kill the process with the given pid.
  // The victim won't exit until it tries to return
  // to user space (see usertrap() in trap.c).
-@@ -597,7 +828,7 @@ kkill(int pid)
+@@ -597,7 +833,7 @@ kkill(int pid)
        p->killed = 1;
        if(p->state == SLEEPING){
          // Wake process from sleep().
@@ -460,7 +465,7 @@ index 9d6cf3f..94dd7fa 100644
        }
        release(&p->lock);
        return 0;
-@@ -682,6 +913,10 @@ procdump(void)
+@@ -682,6 +918,10 @@ procdump(void)
      else
        state = "???";
      printf("%d %s %s", p->pid, state, p->name);
