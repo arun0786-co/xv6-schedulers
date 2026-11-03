@@ -1,5 +1,5 @@
 diff --git a/Makefile b/Makefile
-index 2d5f9e4..78129b7 100644
+index 2d5f9e4..ad7934d 100644
 --- a/Makefile
 +++ b/Makefile
 @@ -81,6 +81,28 @@ ifneq ($(shell $(CC) -dumpspecs 2>/dev/null | grep -e '[^f]nopie'),)
@@ -31,16 +31,17 @@ index 2d5f9e4..78129b7 100644
  LDFLAGS = -z max-page-size=4096
  
  $K/kernel: $(OBJS) $K/kernel.ld
-@@ -142,6 +164,8 @@ UPROGS=\
+@@ -142,6 +164,9 @@ UPROGS=\
  	$U/_logstress\
  	$U/_forphan\
  	$U/_dorphan\
 +	$U/_readcount\
 +	$U/_readrace\
++	$U/_schedulertest\
  
  fs.img: mkfs/mkfs README $(UPROGS)
  	mkfs/mkfs fs.img README $(UPROGS)
-@@ -151,7 +175,7 @@ fs.img: mkfs/mkfs README $(UPROGS)
+@@ -151,7 +176,7 @@ fs.img: mkfs/mkfs README $(UPROGS)
  clean: 
  	rm -f *.tex *.dvi *.idx *.aux *.log *.ind *.ilg \
  	*/*.o */*.d */*.asm */*.sym \
@@ -49,11 +50,30 @@ index 2d5f9e4..78129b7 100644
  	mkfs/mkfs .gdbinit \
          $U/usys.S \
  	$(UPROGS)
+diff --git a/kernel/defs.h b/kernel/defs.h
+index 122d9ca..281d30d 100644
+--- a/kernel/defs.h
++++ b/kernel/defs.h
+@@ -95,12 +95,13 @@ void            scheduler(void) __attribute__((noreturn));
+ void            sched(void);
+ void            sleep(void*, struct spinlock*);
+ void            userinit(void);
+-int             kwait(uint64);
++int             kwait(uint64, uint*, uint*);
+ void            wakeup(void*);
+ void            yield(void);
+ int             either_copyout(int user_dst, uint64 dst, void *src, uint64 len);
+ int             either_copyin(void *dst, int user_src, uint64 src, uint64 len);
+ void            procdump(void);
++void            proctick(void);
+ 
+ // swtch.S
+ void            swtch(struct context*, struct context*);
 diff --git a/kernel/proc.c b/kernel/proc.c
-index 9d6cf3f..cc0cb3c 100644
+index 9d6cf3f..7588de8 100644
 --- a/kernel/proc.c
 +++ b/kernel/proc.c
-@@ -15,6 +15,63 @@ struct proc *initproc;
+@@ -15,9 +15,76 @@ struct proc *initproc;
  int nextpid = 1;
  struct spinlock pid_lock;
  
@@ -117,10 +137,27 @@ index 9d6cf3f..cc0cb3c 100644
  extern void forkret(void);
  static void freeproc(struct proc *p);
  
-@@ -146,6 +203,13 @@ found:
++// The current tick, for timestamps. It reads ticks without tickslock
++// because callers may hold a p->lock, and clockintr() takes tickslock
++// first and then p->lock (in wakeup), so taking them in the other order
++// could deadlock.
++static uint
++now(void)
++{
++  return __atomic_load_n(&ticks, __ATOMIC_RELAXED);
++}
++
+ extern char trampoline[]; // trampoline.S
+ 
+ // helps ensure that wakeups of wait()ing
+@@ -146,6 +213,17 @@ found:
    p->context.ra = (uint64)forkret;
    p->context.sp = p->kstack + PGSIZE;
  
++  p->ctime = now();
++  p->rtime = 0;
++  p->etime = 0;
++
 +  // Initialize scheduling fields
 +  p->creation_time = global_time++;
 +  p->nice = 0;  // Default nice value
@@ -131,7 +168,38 @@ index 9d6cf3f..cc0cb3c 100644
    return p;
  }
  
-@@ -434,6 +498,101 @@ scheduler(void)
+@@ -354,6 +432,7 @@ kexit(int status)
+ 
+   p->xstate = status;
+   p->state = ZOMBIE;
++  p->etime = now();
+ 
+   release(&wait_lock);
+ 
+@@ -364,8 +443,10 @@ kexit(int status)
+ 
+ // Wait for a child process to exit and return its pid.
+ // Return -1 if this process has no children.
++// If rtime and wtime are not null, they receive the ticks the child
++// spent running, and alive but not running.
+ int
+-kwait(uint64 addr)
++kwait(uint64 addr, uint *rtime, uint *wtime)
+ {
+   struct proc *pp;
+   int havekids, pid;
+@@ -391,6 +472,10 @@ kwait(uint64 addr)
+             release(&wait_lock);
+             return -1;
+           }
++          if(rtime)
++            *rtime = pp->rtime;
++          if(wtime)
++            *wtime = pp->etime - pp->ctime - pp->rtime;
+           freeproc(pp);
+           release(&pp->lock);
+           release(&wait_lock);
+@@ -434,6 +519,101 @@ scheduler(void)
      intr_on();
      intr_off();
  
@@ -233,7 +301,7 @@ index 9d6cf3f..cc0cb3c 100644
      int found = 0;
      for(p = proc; p < &proc[NPROC]; p++) {
        acquire(&p->lock);
-@@ -456,6 +615,7 @@ scheduler(void)
+@@ -456,9 +636,24 @@ scheduler(void)
        // nothing to run; stop running on this core until an interrupt.
        asm volatile("wfi");
      }
@@ -241,11 +309,38 @@ index 9d6cf3f..cc0cb3c 100644
    }
  }
  
++// Called on every timer interrupt of every CPU: charge the tick to the
++// process running on this CPU, if there is one.
++void
++proctick(void)
++{
++  struct proc *p = myproc();
++
++  if(p == 0)
++    return;
++  acquire(&p->lock);
++  p->rtime++;
++  release(&p->lock);
++}
++
+ // Switch to scheduler.  Must hold only p->lock
+ // and have changed proc->state. Saves and restores
+ // intena because intena is a property of this
 diff --git a/kernel/proc.h b/kernel/proc.h
-index d021857..2ac988b 100644
+index d021857..f597c7d 100644
 --- a/kernel/proc.h
 +++ b/kernel/proc.h
-@@ -104,4 +104,11 @@ struct proc {
+@@ -91,6 +91,9 @@ struct proc {
+   int killed;                  // If non-zero, have been killed
+   int xstate;                  // Exit status to be returned to parent's wait
+   int pid;                     // Process ID
++  uint ctime;                  // Tick the process was created
++  uint rtime;                  // Ticks it has spent running
++  uint etime;                  // Tick it exited
+ 
+   // wait_lock must be held when using this:
+   struct proc *parent;         // Parent process
+@@ -104,4 +107,11 @@ struct proc {
    struct file *ofile[NOFILE];  // Open files
    struct inode *cwd;           // Current directory
    char name[16];               // Process name (debugging)
@@ -258,34 +353,37 @@ index d021857..2ac988b 100644
 +  uint64 last_run_time;        // Last time process ran
  };
 diff --git a/kernel/syscall.c b/kernel/syscall.c
-index 076d965..b694c91 100644
+index 076d965..b1da869 100644
 --- a/kernel/syscall.c
 +++ b/kernel/syscall.c
-@@ -101,6 +101,7 @@ extern uint64 sys_unlink(void);
+@@ -101,6 +101,8 @@ extern uint64 sys_unlink(void);
  extern uint64 sys_link(void);
  extern uint64 sys_mkdir(void);
  extern uint64 sys_close(void);
 +extern uint64 sys_getreadcount(void);
++extern uint64 sys_waitx(void);
  
  // An array mapping syscall numbers from syscall.h
  // to the function that handles the system call.
-@@ -126,6 +127,7 @@ static uint64 (*syscalls[])(void) = {
+@@ -126,6 +128,8 @@ static uint64 (*syscalls[])(void) = {
  [SYS_link]    sys_link,
  [SYS_mkdir]   sys_mkdir,
  [SYS_close]   sys_close,
 +[SYS_getreadcount] sys_getreadcount,
++[SYS_waitx]   sys_waitx,
  };
  
  void
 diff --git a/kernel/syscall.h b/kernel/syscall.h
-index 3dd926d..0cf477a 100644
+index 3dd926d..c273021 100644
 --- a/kernel/syscall.h
 +++ b/kernel/syscall.h
-@@ -20,3 +20,4 @@
+@@ -20,3 +20,5 @@
  #define SYS_link   19
  #define SYS_mkdir  20
  #define SYS_close  21
 +#define SYS_getreadcount 22
++#define SYS_waitx  23
 diff --git a/kernel/sysfile.c b/kernel/sysfile.c
 index d8234ce..4c24446 100644
 --- a/kernel/sysfile.c
@@ -334,21 +432,57 @@ index d8234ce..4c24446 100644
 +{
 +  return __atomic_load_n(&readcount, __ATOMIC_RELAXED);
 +}
+diff --git a/kernel/sysproc.c b/kernel/sysproc.c
+index 3044d00..8733b15 100644
+--- a/kernel/sysproc.c
++++ b/kernel/sysproc.c
+@@ -33,7 +33,29 @@ sys_wait(void)
+ {
+   uint64 p;
+   argaddr(0, &p);
+-  return kwait(p);
++  return kwait(p, 0, 0);
++}
++
++// waitx(int *status, int *wtime, int *rtime): wait() that also reports how
++// many ticks the child spent running (rtime), and alive but not running
++// (wtime: waiting for a CPU, or sleeping).
++uint64
++sys_waitx(void)
++{
++  uint64 addr, waddr, raddr;
++  uint wtime, rtime;
++  int pid;
++  struct proc *p = myproc();
++
++  argaddr(0, &addr);
++  argaddr(1, &waddr);
++  argaddr(2, &raddr);
++  if((pid = kwait(addr, &rtime, &wtime)) < 0)
++    return -1;
++  if(copyout(p->pagetable, waddr, (char *)&wtime, sizeof(wtime)) < 0 ||
++     copyout(p->pagetable, raddr, (char *)&rtime, sizeof(rtime)) < 0)
++    return -1;
++  return pid;
+ }
+ 
+ uint64
 diff --git a/kernel/trap.c b/kernel/trap.c
-index a41cd69..5e81bd6 100644
+index a41cd69..571394f 100644
 --- a/kernel/trap.c
 +++ b/kernel/trap.c
-@@ -171,6 +171,10 @@ clockintr()
+@@ -170,6 +170,11 @@ clockintr()
+     wakeup(&ticks);
      release(&tickslock);
    }
- 
++  proctick();
++
 +  // Increment global time for scheduling
 +  extern uint64 global_time;
 +  global_time++;
-+
+ 
    // ask for the next timer interrupt. this also clears
    // the interrupt request. 1000000 is about a tenth
-   // of a second.
 diff --git a/user/readcount.c b/user/readcount.c
 new file mode 100644
 index 0000000..6e2665b
@@ -456,24 +590,83 @@ index 0000000..0e59177
 +  printf("readrace: expected %d, counted %u\n", procs * reads, grew);
 +  exit(grew == (uint)(procs * reads) ? 0 : 1);
 +}
+diff --git a/user/schedulertest.c b/user/schedulertest.c
+new file mode 100644
+index 0000000..db426fc
+--- /dev/null
++++ b/user/schedulertest.c
+@@ -0,0 +1,51 @@
++#include "kernel/types.h"
++#include "user/user.h"
++
++// usage: schedulertest [-v]
++// Forks NFORK children at once. The first IO of them sleep, as an I/O-bound
++// process would; the rest spin on the CPU. Prints the average number of
++// ticks the children spent running (rtime) and alive but not running
++// (wtime), as reported by waitx(). With -v it also prints each child, in
++// the order they were collected.
++#define NFORK 10
++#define IO 5
++#define SPIN 1000000000
++
++int
++main(int argc, char *argv[])
++{
++  int verbose = argc > 1 && strcmp(argv[1], "-v") == 0;
++  int pids[NFORK];
++  int n, pid, wtime, rtime, twtime = 0, trtime = 0;
++
++  for(n = 0; n < NFORK; n++){
++    pid = fork();
++    if(pid < 0)
++      break;
++    if(pid == 0){
++      if(n < IO){
++        pause(200);
++      } else {
++        for(volatile int i = 0; i < SPIN; i++)
++          ;
++      }
++      exit(0);
++    }
++    pids[n] = pid;
++  }
++  for(int left = n; left > 0; left--){
++    if((pid = waitx(0, &wtime, &rtime)) < 0)
++      break;
++    trtime += rtime;
++    twtime += wtime;
++    if(verbose){
++      int i = 0;
++      while(i < n && pids[i] != pid)
++        i++;
++      printf("child %d (%s, pid %d): rtime %d, wtime %d\n",
++             i, i < IO ? "sleeps" : "spins", pid, rtime, wtime);
++    }
++  }
++  printf("Average rtime %d,  wtime %d\n", trtime / NFORK, twtime / NFORK);
++  exit(0);
++}
 diff --git a/user/user.h b/user/user.h
-index ac84de9..5390ed6 100644
+index ac84de9..d297c98 100644
 --- a/user/user.h
 +++ b/user/user.h
-@@ -24,6 +24,7 @@ int getpid(void);
+@@ -24,6 +24,8 @@ int getpid(void);
  char* sys_sbrk(int,int);
  int pause(int);
  int uptime(void);
 +uint getreadcount(void);
++int waitx(int*, int*, int*);
  
  // ulib.c
  int stat(const char*, struct stat*);
 diff --git a/user/usys.pl b/user/usys.pl
-index c5d4c3a..05223bf 100755
+index c5d4c3a..576759d 100755
 --- a/user/usys.pl
 +++ b/user/usys.pl
-@@ -42,3 +42,4 @@ entry("getpid");
+@@ -42,3 +42,5 @@ entry("getpid");
  entry("sbrk");
  entry("pause");
  entry("uptime");
 +entry("getreadcount");
++entry("waitx");
