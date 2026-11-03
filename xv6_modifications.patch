@@ -84,7 +84,7 @@ index 122d9ca..31faf4b 100644
  // swtch.S
  void            swtch(struct context*, struct context*);
 diff --git a/kernel/proc.c b/kernel/proc.c
-index 9d6cf3f..0c124f9 100644
+index 9d6cf3f..94dd7fa 100644
 --- a/kernel/proc.c
 +++ b/kernel/proc.c
 @@ -15,9 +15,67 @@ struct proc *initproc;
@@ -460,6 +460,17 @@ index 9d6cf3f..0c124f9 100644
        }
        release(&p->lock);
        return 0;
+@@ -682,6 +913,10 @@ procdump(void)
+     else
+       state = "???";
+     printf("%d %s %s", p->pid, state, p->name);
++    printf("  ctime %u rtime %u nice %d", p->ctime, p->rtime, p->nice);
++#ifdef SCHEDULER_CFS
++    printf(" vruntime %lu", p->vruntime);
++#endif
+     printf("\n");
+   }
+ }
 diff --git a/kernel/proc.h b/kernel/proc.h
 index d021857..9d89f9b 100644
 --- a/kernel/proc.h
