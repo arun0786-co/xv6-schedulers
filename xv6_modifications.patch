@@ -51,10 +51,10 @@ index 2d5f9e4..ad7934d 100644
          $U/usys.S \
  	$(UPROGS)
 diff --git a/kernel/defs.h b/kernel/defs.h
-index 122d9ca..281d30d 100644
+index 122d9ca..9276214 100644
 --- a/kernel/defs.h
 +++ b/kernel/defs.h
-@@ -95,12 +95,13 @@ void            scheduler(void) __attribute__((noreturn));
+@@ -95,12 +95,14 @@ void            scheduler(void) __attribute__((noreturn));
  void            sched(void);
  void            sleep(void*, struct spinlock*);
  void            userinit(void);
@@ -66,11 +66,12 @@ index 122d9ca..281d30d 100644
  int             either_copyin(void *dst, int user_src, uint64 src, uint64 len);
  void            procdump(void);
 +void            proctick(void);
++int             preempt(void);
  
  // swtch.S
  void            swtch(struct context*, struct context*);
 diff --git a/kernel/proc.c b/kernel/proc.c
-index 9d6cf3f..7588de8 100644
+index 9d6cf3f..5440303 100644
 --- a/kernel/proc.c
 +++ b/kernel/proc.c
 @@ -15,9 +15,76 @@ struct proc *initproc;
@@ -150,7 +151,7 @@ index 9d6cf3f..7588de8 100644
  extern char trampoline[]; // trampoline.S
  
  // helps ensure that wakeups of wait()ing
-@@ -146,6 +213,17 @@ found:
+@@ -146,6 +213,16 @@ found:
    p->context.ra = (uint64)forkret;
    p->context.sp = p->kstack + PGSIZE;
  
@@ -159,7 +160,6 @@ index 9d6cf3f..7588de8 100644
 +  p->etime = 0;
 +
 +  // Initialize scheduling fields
-+  p->creation_time = global_time++;
 +  p->nice = 0;  // Default nice value
 +  p->vruntime = 0;
 +  p->weight = calculate_weight(0);  // Calculate weight for nice=0
@@ -168,7 +168,7 @@ index 9d6cf3f..7588de8 100644
    return p;
  }
  
-@@ -354,6 +432,7 @@ kexit(int status)
+@@ -354,6 +431,7 @@ kexit(int status)
  
    p->xstate = status;
    p->state = ZOMBIE;
@@ -176,7 +176,7 @@ index 9d6cf3f..7588de8 100644
  
    release(&wait_lock);
  
-@@ -364,8 +443,10 @@ kexit(int status)
+@@ -364,8 +442,10 @@ kexit(int status)
  
  // Wait for a child process to exit and return its pid.
  // Return -1 if this process has no children.
@@ -188,7 +188,7 @@ index 9d6cf3f..7588de8 100644
  {
    struct proc *pp;
    int havekids, pid;
-@@ -391,6 +472,10 @@ kwait(uint64 addr)
+@@ -391,6 +471,10 @@ kwait(uint64 addr)
              release(&wait_lock);
              return -1;
            }
@@ -199,39 +199,77 @@ index 9d6cf3f..7588de8 100644
            freeproc(pp);
            release(&pp->lock);
            release(&wait_lock);
-@@ -434,6 +519,101 @@ scheduler(void)
+@@ -411,6 +495,54 @@ kwait(uint64 addr)
+   }
+ }
+ 
++#ifdef SCHEDULER_FCFS
++// FCFS: choose the RUNNABLE process that was created first. Several
++// processes can be created in the same tick; the lower pid was allocated
++// first. Returns the process with its lock held, or 0 if none is RUNNABLE.
++static struct proc*
++pick(void)
++{
++  struct proc *p, *best;
++  uint ctime;
++  int pid;
++
++  for(;;){
++    best = 0;
++    ctime = pid = 0;
++    for(p = proc; p < &proc[NPROC]; p++){
++      acquire(&p->lock);
++      if(p->state == RUNNABLE &&
++         (best == 0 || p->ctime < ctime || (p->ctime == ctime && p->pid < pid))){
++        best = p;
++        ctime = p->ctime;
++        pid = p->pid;
++      }
++      release(&p->lock);
++    }
++    if(best == 0)
++      return 0;
++    // Another CPU may have taken it since we looked.
++    acquire(&best->lock);
++    if(best->state == RUNNABLE && best->pid == pid)
++      return best;
++    release(&best->lock);
++  }
++}
++#endif
++
++// On a timer interrupt: should the running process give up the CPU?
++int
++preempt(void)
++{
++#if defined(SCHEDULER_FCFS)
++  // FCFS keeps a process on the CPU until it exits or sleeps.
++  return 0;
++#else
++  // Round robin switches on every tick.
++  return 1;
++#endif
++}
++
+ // Per-CPU process scheduler.
+ // Each CPU calls scheduler() after setting itself up.
+ // Scheduler never returns.  It loops, doing:
+@@ -434,6 +566,84 @@ scheduler(void)
      intr_on();
      intr_off();
  
 +#ifdef SCHEDULER_FCFS
-+    // First Come First Serve scheduler
-+    struct proc *selected = 0;
-+    uint64 earliest_time = ~0ULL;  // Maximum uint64 value
-+    
-+    for(p = proc; p < &proc[NPROC]; p++) {
-+      acquire(&p->lock);
-+      if(p->state == RUNNABLE) {
-+        if(p->creation_time < earliest_time) {
-+          if(selected) release(&selected->lock);
-+          selected = p;
-+          earliest_time = p->creation_time;
-+        } else {
-+          release(&p->lock);
-+        }
-+      } else {
-+        release(&p->lock);
-+      }
-+    }
-+    
-+    if(selected) {
-+      selected->state = RUNNING;
-+      c->proc = selected;
-+      swtch(&c->context, &selected->context);
-+      c->proc = 0;
-+      release(&selected->lock);
-+    } else {
++    if((p = pick()) == 0){
 +      asm volatile("wfi");
++      continue;
 +    }
++    // It is the process's job to release its lock and then reacquire
++    // it before jumping back to us.
++    p->state = RUNNING;
++    c->proc = p;
++    swtch(&c->context, &p->context);
++    c->proc = 0;
++    release(&p->lock);
 +
 +#elif defined(SCHEDULER_CFS)
 +    // Completely Fair Scheduler
@@ -301,7 +339,7 @@ index 9d6cf3f..7588de8 100644
      int found = 0;
      for(p = proc; p < &proc[NPROC]; p++) {
        acquire(&p->lock);
-@@ -456,9 +636,24 @@ scheduler(void)
+@@ -456,9 +666,24 @@ scheduler(void)
        // nothing to run; stop running on this core until an interrupt.
        asm volatile("wfi");
      }
@@ -327,7 +365,7 @@ index 9d6cf3f..7588de8 100644
  // and have changed proc->state. Saves and restores
  // intena because intena is a property of this
 diff --git a/kernel/proc.h b/kernel/proc.h
-index d021857..f597c7d 100644
+index d021857..1e21173 100644
 --- a/kernel/proc.h
 +++ b/kernel/proc.h
 @@ -91,6 +91,9 @@ struct proc {
@@ -340,13 +378,12 @@ index d021857..f597c7d 100644
  
    // wait_lock must be held when using this:
    struct proc *parent;         // Parent process
-@@ -104,4 +107,11 @@ struct proc {
+@@ -104,4 +107,10 @@ struct proc {
    struct file *ofile[NOFILE];  // Open files
    struct inode *cwd;           // Current directory
    char name[16];               // Process name (debugging)
 +  
 +  // Scheduling fields
-+  uint64 creation_time;        // Process creation time for FCFS
 +  int nice;                    // Nice value for CFS (-20 to 19)
 +  uint64 vruntime;             // Virtual runtime for CFS
 +  uint64 weight;               // Process weight for CFS
@@ -468,10 +505,34 @@ index 3044d00..8733b15 100644
  
  uint64
 diff --git a/kernel/trap.c b/kernel/trap.c
-index a41cd69..571394f 100644
+index a41cd69..41f7773 100644
 --- a/kernel/trap.c
 +++ b/kernel/trap.c
-@@ -170,6 +170,11 @@ clockintr()
+@@ -80,8 +80,9 @@ usertrap(void)
+   if(killed(p))
+     kexit(-1);
+ 
+-  // give up the CPU if this is a timer interrupt.
+-  if(which_dev == 2)
++  // give up the CPU if this is a timer interrupt and the
++  // scheduling policy preempts.
++  if(which_dev == 2 && preempt())
+     yield();
+ 
+   prepare_return();
+@@ -151,8 +152,9 @@ kerneltrap()
+     panic("kerneltrap");
+   }
+ 
+-  // give up the CPU if this is a timer interrupt.
+-  if(which_dev == 2 && myproc() != 0)
++  // give up the CPU if this is a timer interrupt and the
++  // scheduling policy preempts.
++  if(which_dev == 2 && myproc() != 0 && preempt())
+     yield();
+ 
+   // the yield() may have caused some traps to occur,
+@@ -170,6 +172,11 @@ clockintr()
      wakeup(&ticks);
      release(&tickslock);
    }
