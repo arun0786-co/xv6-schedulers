@@ -1,3 +1,47 @@
+diff --git a/Makefile b/Makefile
+index 2d5f9e4..9b9e08b 100644
+--- a/Makefile
++++ b/Makefile
+@@ -81,6 +81,22 @@ ifneq ($(shell $(CC) -dumpspecs 2>/dev/null | grep -e '[^f]nopie'),)
+ CFLAGS += -fno-pie -nopie
+ endif
+ 
++# Scheduling policy, chosen at build time: make qemu SCHEDULER=FCFS
++SCHEDULER ?= RR
++ifeq ($(filter $(SCHEDULER),RR FCFS CFS),)
++$(error SCHEDULER must be RR, FCFS or CFS)
++endif
++CFLAGS += -DSCHEDULER_$(SCHEDULER)
++
++# Make cannot see a change in compiler flags, so the kernel options are kept
++# in a file that is rewritten only when they change, and every kernel object
++# depends on that file.
++KOPTS = $(SCHEDULER)
++$K/kernel.options: FORCE
++	@echo '$(KOPTS)' | cmp -s - $@ || echo '$(KOPTS)' > $@
++$(OBJS): $K/kernel.options
++.PHONY: FORCE
++
+ LDFLAGS = -z max-page-size=4096
+ 
+ $K/kernel: $(OBJS) $K/kernel.ld
+@@ -142,6 +158,7 @@ UPROGS=\
+ 	$U/_logstress\
+ 	$U/_forphan\
+ 	$U/_dorphan\
++	$U/_readcount\
+ 
+ fs.img: mkfs/mkfs README $(UPROGS)
+ 	mkfs/mkfs fs.img README $(UPROGS)
+@@ -151,7 +168,7 @@ fs.img: mkfs/mkfs README $(UPROGS)
+ clean: 
+ 	rm -f *.tex *.dvi *.idx *.aux *.log *.ind *.ilg \
+ 	*/*.o */*.d */*.asm */*.sym \
+-	$K/kernel fs.img \
++	$K/kernel $K/kernel.options fs.img \
+ 	mkfs/mkfs .gdbinit \
+         $U/usys.S \
+ 	$(UPROGS)
 diff --git a/kernel/proc.c b/kernel/proc.c
 index 9d6cf3f..cc0cb3c 100644
 --- a/kernel/proc.c
@@ -343,80 +387,6 @@ index 0000000..02e0d0f
 +           bytes_read, final_count - initial_count);
 +  }
 +
-+  exit(0);
-+}
-diff --git a/user/schedulertest.c b/user/schedulertest.c
-new file mode 100644
-index 0000000..82afd7a
---- /dev/null
-+++ b/user/schedulertest.c
-@@ -0,0 +1,68 @@
-+#include "kernel/types.h"
-+#include "kernel/stat.h"
-+#include "user/user.h"
-+
-+int
-+main(int argc, char *argv[])
-+{
-+  int pid1, pid2, pid3;
-+  int start_time, end_time;
-+  
-+  printf("Scheduler Test Program\n");
-+  printf("=====================\n");
-+  
-+  start_time = uptime();
-+  printf("Start time: %d\n", start_time);
-+  
-+  // Create three child processes
-+  if((pid1 = fork()) == 0) {
-+    // Child 1 - CPU intensive
-+    printf("Child 1 (PID: %d) starting CPU intensive task\n", getpid());
-+    for(int i = 0; i < 1000000; i++) {
-+      // CPU intensive loop
-+      volatile int j = i * i;
-+      (void)j; // Prevent optimization
-+    }
-+    printf("Child 1 (PID: %d) completed\n", getpid());
-+    exit(0);
-+  }
-+  
-+  if((pid2 = fork()) == 0) {
-+    // Child 2 - Mixed workload
-+    printf("Child 2 (PID: %d) starting mixed workload\n", getpid());
-+    for(int i = 0; i < 500000; i++) {
-+      volatile int j = i * i;
-+      (void)j;
-+      if(i % 10000 == 0) {
-+        // Simulate I/O by yielding
-+        yield();
-+      }
-+    }
-+    printf("Child 2 (PID: %d) completed\n", getpid());
-+    exit(0);
-+  }
-+  
-+  if((pid3 = fork()) == 0) {
-+    // Child 3 - I/O intensive
-+    printf("Child 3 (PID: %d) starting I/O intensive task\n", getpid());
-+    for(int i = 0; i < 100; i++) {
-+      // Simulate I/O by sleeping
-+      sleep(1);
-+    }
-+    printf("Child 3 (PID: %d) completed\n", getpid());
-+    exit(0);
-+  }
-+  
-+  // Parent waits for all children
-+  int status;
-+  wait(&status);
-+  wait(&status);
-+  wait(&status);
-+  
-+  end_time = uptime();
-+  printf("End time: %d\n", end_time);
-+  printf("Total execution time: %d ticks\n", end_time - start_time);
-+  printf("Scheduler test completed\n");
-+  
 +  exit(0);
 +}
 diff --git a/user/user.h b/user/user.h
