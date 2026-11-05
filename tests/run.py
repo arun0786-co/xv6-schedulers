@@ -1,12 +1,9 @@
 #!/usr/bin/env python3
-"""Build xv6 with xv6_modifications.patch and check it in qemu.
+"""Build each scheduler and check it in qemu.
 
-usage: python3 test.py
+usage: tests/run.py
 
-The first run clones mit-pdos/xv6-riscv into build/xv6-riscv. Every run
-resets that checkout to the commit the patch was made against (throwing away
-any changes made there), applies the patch, builds each scheduler, boots it
-in qemu and checks what the test programs print. Needs git, make, a RISC-V
+Boots each policy and checks what the test programs print. Needs make, a RISC-V
 gcc (riscv64-unknown-elf- or riscv64-linux-gnu-) and qemu-system-riscv64.
 """
 import os
@@ -16,11 +13,7 @@ import subprocess
 import sys
 import time
 
-BASE = "9dbd536ea4513b5f66c3cb28788aaf0c311bd122"
-REPO = "https://github.com/mit-pdos/xv6-riscv.git"
-HERE = os.path.dirname(os.path.abspath(__file__))
-SRC = os.path.join(HERE, "build", "xv6-riscv")
-PATCH = os.path.join(HERE, "xv6_modifications.patch")
+SRC = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 # One block of the CFS log, and any single line of it. On one CPU a block is
 # printed with interrupts off, so nothing else lands inside it.
@@ -40,20 +33,6 @@ def check(name, ok, detail=""):
     else:
         failures += 1
         print("FAIL " + name + (": " + detail if detail else ""))
-
-
-def git(*args):
-    subprocess.run(["git", "-C", SRC] + list(args), check=True)
-
-
-def setup():
-    if not os.path.isdir(SRC):
-        os.makedirs(os.path.dirname(SRC), exist_ok=True)
-        subprocess.run(["git", "clone", "-q", REPO, SRC], check=True)
-    git("checkout", "-q", "--detach", BASE)
-    git("reset", "-q", "--hard")
-    git("clean", "-qfdx")
-    git("apply", PATCH)
 
 
 def build(**opts):
@@ -125,11 +104,6 @@ def spinners_overlap(kids):
 
 
 def main():
-    setup()
-    with open(os.path.join(HERE, "readcount.c")) as a, \
-         open(os.path.join(SRC, "user", "readcount.c")) as b:
-        check("readcount.c matches user/readcount.c in the patch", a.read() == b.read())
-
     # Round robin, 3 CPUs: getreadcount, also under concurrent reads.
     build(SCHEDULER="RR")
     out = boot(3, ["readcount", "readrace 3 20000"])

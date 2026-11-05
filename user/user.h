@@ -24,6 +24,9 @@ int getpid(void);
 char* sys_sbrk(int,int);
 int pause(int);
 int uptime(void);
+uint getreadcount(void);
+int waitx(int*, int*, int*);
+int setnice(int, int);
 
 // ulib.c
 int stat(const char*, struct stat*);

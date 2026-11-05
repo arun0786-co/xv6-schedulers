@@ -33,7 +33,29 @@ sys_wait(void)
 {
   uint64 p;
   argaddr(0, &p);
-  return kwait(p);
+  return kwait(p, 0, 0);
+}
+
+// waitx(int *status, int *wtime, int *rtime): wait() that also reports how
+// many ticks the child spent running (rtime), and alive but not running
+// (wtime: waiting for a CPU, or sleeping).
+uint64
+sys_waitx(void)
+{
+  uint64 addr, waddr, raddr;
+  uint wtime, rtime;
+  int pid;
+  struct proc *p = myproc();
+
+  argaddr(0, &addr);
+  argaddr(1, &waddr);
+  argaddr(2, &raddr);
+  if((pid = kwait(addr, &rtime, &wtime)) < 0)
+    return -1;
+  if(copyout(p->pagetable, waddr, (char *)&wtime, sizeof(wtime)) < 0 ||
+     copyout(p->pagetable, raddr, (char *)&rtime, sizeof(rtime)) < 0)
+    return -1;
+  return pid;
 }
 
 uint64
@@ -82,6 +104,19 @@ sys_pause(void)
   }
   release(&tickslock);
   return 0;
+}
+
+// setnice(pid, nice): set a process's nice value, -20 (most CPU time) to
+// 19 (least), which sets its CFS weight. Returns 0, or -1 if there is no
+// such process or the value is out of range.
+uint64
+sys_setnice(void)
+{
+  int pid, nice;
+
+  argint(0, &pid);
+  argint(1, &nice);
+  return ksetnice(pid, nice);
 }
 
 uint64

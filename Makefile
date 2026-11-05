@@ -81,6 +81,32 @@ ifneq ($(shell $(CC) -dumpspecs 2>/dev/null | grep -e '[^f]nopie'),)
 CFLAGS += -fno-pie -nopie
 endif
 
+# Scheduling policy, chosen at build time: make qemu SCHEDULER=FCFS
+SCHEDULER ?= RR
+ifeq ($(filter $(SCHEDULER),RR FCFS CFS),)
+$(error SCHEDULER must be RR, FCFS or CFS)
+endif
+CFLAGS += -DSCHEDULER_$(SCHEDULER)
+
+# CFS prints the run queue before every decision; make CFSLOG=0 turns it off.
+CFSLOG ?= 1
+CFLAGS += -DCFSLOG=$(CFSLOG)
+
+# Start the read counter close to the top, to test its wrap-around:
+# make qemu READCOUNT_START=4294967200
+ifdef READCOUNT_START
+CFLAGS += -DREADCOUNT_START=$(READCOUNT_START)
+endif
+
+# Make cannot see a change in compiler flags, so the kernel options are kept
+# in a file that is rewritten only when they change, and every kernel object
+# depends on that file.
+KOPTS = $(SCHEDULER) $(CFSLOG) $(READCOUNT_START)
+$K/kernel.options: FORCE
+	@echo '$(KOPTS)' | cmp -s - $@ || echo '$(KOPTS)' > $@
+$(OBJS): $K/kernel.options
+.PHONY: FORCE
+
 LDFLAGS = -z max-page-size=4096
 
 $K/kernel: $(OBJS) $K/kernel.ld
@@ -142,6 +168,10 @@ UPROGS=\
 	$U/_logstress\
 	$U/_forphan\
 	$U/_dorphan\
+	$U/_readcount\
+	$U/_readrace\
+	$U/_schedulertest\
+	$U/_nicetest\
 
 fs.img: mkfs/mkfs README $(UPROGS)
 	mkfs/mkfs fs.img README $(UPROGS)
@@ -151,7 +181,7 @@ fs.img: mkfs/mkfs README $(UPROGS)
 clean: 
 	rm -f *.tex *.dvi *.idx *.aux *.log *.ind *.ilg \
 	*/*.o */*.d */*.asm */*.sym \
-	$K/kernel fs.img \
+	$K/kernel $K/kernel.options fs.img \
 	mkfs/mkfs .gdbinit \
         $U/usys.S \
 	$(UPROGS)

@@ -15,8 +15,66 @@ struct proc *initproc;
 int nextpid = 1;
 struct spinlock pid_lock;
 
+#ifdef SCHEDULER_CFS
+#define TARGET_LATENCY 48  // ticks in which every runnable process gets a turn
+#define MIN_SLICE 3        // shortest turn, in ticks
+#define VRT_TICK 1000      // vruntime added by one tick at nice 0
+
+// CFS weight of each nice value from -20 to 19: 1024 / 1.25^nice, rounded
+// the way the Linux kernel rounds it, so nice 0 is 1024, -20 is 88761 and
+// 19 is 15. One nice level apart is about 10% more or less CPU time.
+static const int nice_weight[40] = {
+  /* -20 */ 88761, 71755, 56483, 46273, 36291,
+  /* -15 */ 29154, 23254, 18705, 14949, 11916,
+  /* -10 */  9548,  7620,  6100,  4904,  3906,
+  /*  -5 */  3121,  2501,  1991,  1586,  1277,
+  /*   0 */  1024,   820,   655,   526,   423,
+  /*   5 */   335,   272,   215,   172,   137,
+  /*  10 */   110,    87,    70,    56,    45,
+  /*  15 */    36,    29,    23,    18,    15,
+};
+
+// The run queue: every RUNNABLE process, in ascending order of vruntime.
+// Lock order: p->lock, then rq.lock.
+struct {
+  struct spinlock lock;
+  struct proc *head;
+  int n;
+} rq;
+#endif
+
 extern void forkret(void);
 static void freeproc(struct proc *p);
+
+// The current tick, for timestamps. It reads ticks without tickslock
+// because callers may hold a p->lock, and clockintr() takes tickslock
+// first and then p->lock (in wakeup), so taking them in the other order
+// could deadlock.
+static uint
+now(void)
+{
+  return __atomic_load_n(&ticks, __ATOMIC_RELAXED);
+}
+
+// Mark p RUNNABLE. Under CFS it also goes into the run queue, behind every
+// process with a lower or equal vruntime, so equal ones take turns.
+// Caller must hold p->lock.
+static void
+setrunnable(struct proc *p)
+{
+  p->state = RUNNABLE;
+#ifdef SCHEDULER_CFS
+  struct proc **pp;
+
+  acquire(&rq.lock);
+  for(pp = &rq.head; *pp && (*pp)->vruntime <= p->vruntime; pp = &(*pp)->rqnext)
+    ;
+  p->rqnext = *pp;
+  *pp = p;
+  rq.n++;
+  release(&rq.lock);
+#endif
+}
 
 extern char trampoline[]; // trampoline.S
 
@@ -51,6 +109,9 @@ procinit(void)
   
   initlock(&pid_lock, "nextpid");
   initlock(&wait_lock, "wait_lock");
+#ifdef SCHEDULER_CFS
+  initlock(&rq.lock, "rq");
+#endif
   for(p = proc; p < &proc[NPROC]; p++) {
       initlock(&p->lock, "proc");
       p->state = UNUSED;
@@ -146,6 +207,12 @@ found:
   p->context.ra = (uint64)forkret;
   p->context.sp = p->kstack + PGSIZE;
 
+  p->ctime = now();
+  p->rtime = 0;
+  p->etime = 0;
+  p->nice = 0;
+  p->vruntime = 0;
+
   return p;
 }
 
@@ -226,7 +293,7 @@ userinit(void)
   
   p->cwd = namei("/");
 
-  p->state = RUNNABLE;
+  setrunnable(p);
 
   release(&p->lock);
 }
@@ -256,9 +323,14 @@ growproc(int n)
 int
 kfork(void)
 {
-  int i, pid;
+  int i, pid, nice;
   struct proc *np;
   struct proc *p = myproc();
+
+  // The child inherits the parent's nice value, as in Unix.
+  acquire(&p->lock);
+  nice = p->nice;
+  release(&p->lock);
 
   // Allocate process.
   if((np = allocproc()) == 0){
@@ -286,6 +358,7 @@ kfork(void)
   np->cwd = idup(p->cwd);
 
   safestrcpy(np->name, p->name, sizeof(p->name));
+  np->nice = nice;
 
   pid = np->pid;
 
@@ -296,7 +369,7 @@ kfork(void)
   release(&wait_lock);
 
   acquire(&np->lock);
-  np->state = RUNNABLE;
+  setrunnable(np);
   release(&np->lock);
 
   return pid;
@@ -354,6 +427,7 @@ kexit(int status)
 
   p->xstate = status;
   p->state = ZOMBIE;
+  p->etime = now();
 
   release(&wait_lock);
 
@@ -364,8 +438,10 @@ kexit(int status)
 
 // Wait for a child process to exit and return its pid.
 // Return -1 if this process has no children.
+// If rtime and wtime are not null, they receive the ticks the child
+// spent running, and alive but not running.
 int
-kwait(uint64 addr)
+kwait(uint64 addr, uint *rtime, uint *wtime)
 {
   struct proc *pp;
   int havekids, pid;
@@ -391,6 +467,15 @@ kwait(uint64 addr)
             release(&wait_lock);
             return -1;
           }
+          if(rtime)
+            *rtime = pp->rtime;
+          if(wtime){
+            // ticks counts CPU 0's timer, but rtime is charged by each
+            // CPU's own timer, so on several CPUs rtime can exceed the
+            // time alive by one tick.
+            uint alive = pp->etime - pp->ctime;
+            *wtime = alive > pp->rtime ? alive - pp->rtime : 0;
+          }
           freeproc(pp);
           release(&pp->lock);
           release(&wait_lock);
@@ -409,6 +494,101 @@ kwait(uint64 addr)
     // Wait for a child to exit.
     sleep(p, &wait_lock);  //DOC: wait-sleep
   }
+}
+
+#ifdef SCHEDULER_FCFS
+// FCFS: choose the RUNNABLE process that was created first. Several
+// processes can be created in the same tick; the lower pid was allocated
+// first. Returns the process with its lock held, or 0 if none is RUNNABLE.
+static struct proc*
+pick(void)
+{
+  struct proc *p, *best;
+  uint ctime;
+  int pid;
+
+  for(;;){
+    best = 0;
+    ctime = pid = 0;
+    for(p = proc; p < &proc[NPROC]; p++){
+      acquire(&p->lock);
+      if(p->state == RUNNABLE &&
+         (best == 0 || p->ctime < ctime || (p->ctime == ctime && p->pid < pid))){
+        best = p;
+        ctime = p->ctime;
+        pid = p->pid;
+      }
+      release(&p->lock);
+    }
+    if(best == 0)
+      return 0;
+    // Another CPU may have taken it since we looked.
+    acquire(&best->lock);
+    if(best->state == RUNNABLE && best->pid == pid)
+      return best;
+    release(&best->lock);
+  }
+}
+#endif
+
+#ifdef SCHEDULER_CFS
+// CFS: take the process with the smallest vruntime, which is the head of
+// the run queue, and give it an equal share of TARGET_LATENCY. Returns the
+// process with its lock held, or 0 if none is RUNNABLE.
+static struct proc*
+pick(void)
+{
+  struct proc *p;
+  int n;
+
+  acquire(&rq.lock);
+  if((p = rq.head) == 0){
+    release(&rq.lock);
+    return 0;
+  }
+#if CFSLOG
+  printf("[Scheduler Tick]\n");
+  for(struct proc *q = p; q; q = q->rqnext)
+    printf("PID: %d | vRuntime: %lu\n", q->pid, q->vruntime);
+  printf("--> Scheduling PID %d (lowest vRuntime)\n", p->pid);
+#endif
+  n = rq.n;
+  rq.head = p->rqnext;
+  rq.n--;
+  release(&rq.lock);
+
+  // Off the queue, p stays RUNNABLE and no other CPU can choose it. If it
+  // has just yielded on another CPU, this waits until that CPU has
+  // switched away from it.
+  acquire(&p->lock);
+  p->slice = TARGET_LATENCY / n;
+  if(p->slice < MIN_SLICE)
+    p->slice = MIN_SLICE;
+  p->slice_used = 0;
+  return p;
+}
+#endif
+
+// On a timer interrupt: should the running process give up the CPU?
+int
+preempt(void)
+{
+#if defined(SCHEDULER_FCFS)
+  // FCFS keeps a process on the CPU until it exits or sleeps.
+  return 0;
+#elif defined(SCHEDULER_CFS)
+  // CFS lets a process use up its slice.
+  struct proc *p = myproc();
+  int over;
+
+  acquire(&p->lock);
+  over = p->slice_used >= p->slice;
+  release(&p->lock);
+  return over;
+#else
+  // Round robin switches on every tick.
+  return 1;
+#endif
 }
 
 // Per-CPU process scheduler.
@@ -434,6 +614,21 @@ scheduler(void)
     intr_on();
     intr_off();
 
+#if defined(SCHEDULER_FCFS) || defined(SCHEDULER_CFS)
+    if((p = pick()) == 0){
+      asm volatile("wfi");
+      continue;
+    }
+    // It is the process's job to release its lock and then reacquire
+    // it before jumping back to us.
+    p->state = RUNNING;
+    c->proc = p;
+    swtch(&c->context, &p->context);
+    c->proc = 0;
+    release(&p->lock);
+
+#else
+    // Default Round Robin scheduler
     int found = 0;
     for(p = proc; p < &proc[NPROC]; p++) {
       acquire(&p->lock);
@@ -456,7 +651,28 @@ scheduler(void)
       // nothing to run; stop running on this core until an interrupt.
       asm volatile("wfi");
     }
+#endif
   }
+}
+
+// Called on every timer interrupt of every CPU: charge the tick to the
+// process running on this CPU, if there is one.
+void
+proctick(void)
+{
+  struct proc *p = myproc();
+
+  if(p == 0)
+    return;
+  acquire(&p->lock);
+  p->rtime++;
+#ifdef SCHEDULER_CFS
+  // Weighted by nice: a tick at nice 0 adds VRT_TICK, and a heavier
+  // process adds less, so it stays near the front of the queue longer.
+  p->vruntime += VRT_TICK * 1024 / nice_weight[p->nice + 20];
+  p->slice_used++;
+#endif
+  release(&p->lock);
 }
 
 // Switch to scheduler.  Must hold only p->lock
@@ -492,7 +708,7 @@ yield(void)
 {
   struct proc *p = myproc();
   acquire(&p->lock);
-  p->state = RUNNABLE;
+  setrunnable(p);
   sched();
   release(&p->lock);
 }
@@ -576,11 +792,31 @@ wakeup(void *chan)
     if(p != myproc()){
       acquire(&p->lock);
       if(p->state == SLEEPING && p->chan == chan) {
-        p->state = RUNNABLE;
+        setrunnable(p);
       }
       release(&p->lock);
     }
   }
+}
+
+// Set the nice value of the process with the given pid.
+int
+ksetnice(int pid, int nice)
+{
+  struct proc *p;
+
+  if(nice < -20 || nice > 19)
+    return -1;
+  for(p = proc; p < &proc[NPROC]; p++){
+    acquire(&p->lock);
+    if(p->pid == pid && p->state != UNUSED){
+      p->nice = nice;
+      release(&p->lock);
+      return 0;
+    }
+    release(&p->lock);
+  }
+  return -1;
 }
 
 // Kill the process with the given pid.
@@ -597,7 +833,7 @@ kkill(int pid)
       p->killed = 1;
       if(p->state == SLEEPING){
         // Wake process from sleep().
-        p->state = RUNNABLE;
+        setrunnable(p);
       }
       release(&p->lock);
       return 0;
@@ -682,6 +918,10 @@ procdump(void)
     else
       state = "???";
     printf("%d %s %s", p->pid, state, p->name);
+    printf("  ctime %u rtime %u nice %d", p->ctime, p->rtime, p->nice);
+#ifdef SCHEDULER_CFS
+    printf(" vruntime %lu", p->vruntime);
+#endif
     printf("\n");
   }
 }

@@ -16,6 +16,15 @@
 #include "file.h"
 #include "fcntl.h"
 
+#ifndef READCOUNT_START
+#define READCOUNT_START 0
+#endif
+
+// Bytes returned by read() since boot, for getreadcount(). It is a uint so
+// that it wraps around to 0 after 2^32 - 1. read() runs on several CPUs at
+// once, so it is only changed with an atomic add.
+static uint readcount = READCOUNT_START;
+
 // Fetch the nth word-sized system call argument as a file descriptor
 // and return both the descriptor and the corresponding struct file.
 static int
@@ -71,12 +80,16 @@ sys_read(void)
   struct file *f;
   int n;
   uint64 p;
+  int r;
 
   argaddr(1, &p);
   argint(2, &n);
   if(argfd(0, 0, &f) < 0)
     return -1;
-  return fileread(f, p, n);
+  r = fileread(f, p, n);
+  if(r > 0)
+    __atomic_fetch_add(&readcount, r, __ATOMIC_RELAXED);
+  return r;
 }
 
 uint64
@@ -502,4 +515,10 @@ sys_pipe(void)
     return -1;
   }
   return 0;
+}
+
+uint64
+sys_getreadcount(void)
+{
+  return __atomic_load_n(&readcount, __ATOMIC_RELAXED);
 }
