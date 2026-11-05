@@ -11,8 +11,12 @@ entryother
 initcode
 initcode.out
 kernelmemfs
-mkfs
+mkfs/mkfs
 kernel/kernel
 user/usys.S
 .gdbinit
 TAGS
+kernel/kernel.options
+EXPLAINED.md
+__pycache__/
+build/
