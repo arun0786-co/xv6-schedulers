@@ -1,8 +1,7 @@
 # xv6: getreadcount, FCFS, CFS and MLFQ
 
 This tree is [mit-pdos/xv6-riscv](https://github.com/mit-pdos/xv6-riscv) at commit
-`9dbd536` (10 September 2025), which is the commit `import xv6-riscv at 9dbd536`
-here, with these changes on top:
+`9dbd536` (10 September 2025), with the changes described here on top. To run it:
 
 ```
 make qemu SCHEDULER=CFS CPUS=1

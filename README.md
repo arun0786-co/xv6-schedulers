@@ -6,7 +6,7 @@ Round robin, FCFS, a Completely Fair Scheduler and a multilevel feedback queue f
 make qemu SCHEDULER=MLFQ CPUS=1    # RR (default), FCFS, CFS or MLFQ. Ctrl-a x quits
 ```
 
-You need a RISC-V gcc (`riscv64-unknown-elf-gcc` or `riscv64-linux-gnu-gcc`) and `qemu-system-riscv64`. The repo holds the whole kernel, and `git diff 9dbd536..` style comparison is one command: the commit `import xv6-riscv at 9dbd536` is upstream's code unchanged.
+You need a RISC-V gcc (`riscv64-unknown-elf-gcc` or `riscv64-linux-gnu-gcc`) and `qemu-system-riscv64`. The repo holds the whole kernel. Upstream's code is imported unchanged in the history, so `git diff de05c9d HEAD -- kernel user Makefile` shows everything changed from it.
 
 ## The schedulers
 
@@ -69,7 +69,7 @@ A fair share is 33%. `make qemu SCHEDULER=MLFQ MLFQ_FAIR=1` counts the clock tim
 ## Tests
 
 ```
-python3 tests/run.py    # about 6 minutes
+python3 tests/run.py    # several minutes
 ```
 
 It builds each policy and boots it in qemu.
