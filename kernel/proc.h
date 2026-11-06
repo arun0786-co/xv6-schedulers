@@ -97,13 +97,21 @@ struct proc {
   int nice;                    // -20 (most CPU time) to 19 (least)
   uint64 vruntime;             // CFS: weighted run time, in 1/1000 tick
   int slice;                   // CFS: ticks this turn on the CPU may last
-  int slice_used;              // CFS: ticks used of this turn
+  int slice_used;              // CFS, MLFQ: ticks used of this turn
+  int first_run;               // Tick it first got a CPU, -1 before that
+  uint nswitch;                // How many times it has been given a CPU
 
   // wait_lock must be held when using this:
   struct proc *parent;         // Parent process
 
   // rq.lock (in proc.c) must be held when using this:
   struct proc *rqnext;         // CFS: next process in the run queue
+
+  // mq.lock (in proc.c) must be held when using these:
+  struct proc *qnext;          // MLFQ: next process in the same queue
+  int level;                   // MLFQ: 0 (highest) to 3 (lowest)
+  uint64 level_time;           // MLFQ_FAIR: clock time used at this level
+  uint64 on_cpu_since;         // MLFQ_FAIR: clock time this turn or charge began
 
   // these are private to the process, so p->lock need not be held.
   uint64 kstack;               // Virtual address of kernel stack

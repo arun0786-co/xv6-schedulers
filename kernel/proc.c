@@ -4,6 +4,7 @@
 #include "riscv.h"
 #include "spinlock.h"
 #include "proc.h"
+#include "schedstat.h"
 #include "defs.h"
 
 struct cpu cpus[NCPU];
@@ -43,6 +44,54 @@ struct {
 } rq;
 #endif
 
+#ifdef SCHEDULER_MLFQ
+#define NQUEUE 4
+#define BOOST_TICKS 48     // every process goes back to the top this often
+#define CLOCK_PER_TICK 1000000  // the timer interval set in clockintr()
+
+static const int mlfq_slice[NQUEUE] = { 1, 4, 8, 16 };
+
+// One first-in first-out queue per level. Lock order: p->lock, then mq.lock.
+struct {
+  struct spinlock lock;
+  struct proc *head[NQUEUE];
+  struct proc *tail[NQUEUE];
+} mq;
+
+// Caller must hold mq.lock.
+static void
+mq_append(int level, struct proc *p)
+{
+  p->qnext = 0;
+  if(mq.tail[level])
+    mq.tail[level]->qnext = p;
+  else
+    mq.head[level] = p;
+  mq.tail[level] = p;
+}
+
+// Move p one level down, or keep it at the bottom. Caller must hold mq.lock.
+static void
+mq_demote(struct proc *p)
+{
+  if(p->level < NQUEUE - 1)
+    p->level++;
+  p->level_time = 0;
+  p->slice_used = 0;
+}
+#endif
+
+// A record of who was on a CPU at each tick, so that what a scheduler really did
+// can be checked from outside. It is off until a program asks for it with
+// schedtrace(), and writes nothing to the console, which would change the timing.
+#define TRACE_MAX 8192
+struct {
+  struct spinlock lock;
+  int on;
+  int n;
+  struct schedevent ev[TRACE_MAX];
+} trace;
+
 extern void forkret(void);
 static void freeproc(struct proc *p);
 
@@ -73,6 +122,16 @@ setrunnable(struct proc *p)
   *pp = p;
   rq.n++;
   release(&rq.lock);
+#endif
+#ifdef SCHEDULER_MLFQ
+  acquire(&mq.lock);
+#if MLFQ_FAIR
+  // used up its time at this level, a little at a time between sleeps
+  if(p->level_time >= (uint64)mlfq_slice[p->level] * CLOCK_PER_TICK)
+    mq_demote(p);
+#endif
+  mq_append(p->level, p);
+  release(&mq.lock);
 #endif
 }
 
@@ -112,6 +171,10 @@ procinit(void)
 #ifdef SCHEDULER_CFS
   initlock(&rq.lock, "rq");
 #endif
+#ifdef SCHEDULER_MLFQ
+  initlock(&mq.lock, "mq");
+#endif
+  initlock(&trace.lock, "trace");
   for(p = proc; p < &proc[NPROC]; p++) {
       initlock(&p->lock, "proc");
       p->state = UNUSED;
@@ -212,6 +275,16 @@ found:
   p->etime = 0;
   p->nice = 0;
   p->vruntime = 0;
+  p->first_run = -1;
+  p->nswitch = 0;
+#ifdef SCHEDULER_MLFQ
+  // a new process starts at the top
+  acquire(&mq.lock);
+  p->level = 0;
+  p->level_time = 0;
+  p->slice_used = 0;
+  release(&mq.lock);
+#endif
 
   return p;
 }
@@ -439,9 +512,10 @@ kexit(int status)
 // Wait for a child process to exit and return its pid.
 // Return -1 if this process has no children.
 // If rtime and wtime are not null, they receive the ticks the child
-// spent running, and alive but not running.
+// spent running, and alive but not running. If st is not null, it receives the
+// child's whole record.
 int
-kwait(uint64 addr, uint *rtime, uint *wtime)
+kwait(uint64 addr, uint *rtime, uint *wtime, struct procstat *st)
 {
   struct proc *pp;
   int havekids, pid;
@@ -475,6 +549,14 @@ kwait(uint64 addr, uint *rtime, uint *wtime)
             // time alive by one tick.
             uint alive = pp->etime - pp->ctime;
             *wtime = alive > pp->rtime ? alive - pp->rtime : 0;
+          }
+          if(st){
+            st->pid = pp->pid;
+            st->ctime = pp->ctime;
+            st->first_run = pp->first_run;
+            st->etime = pp->etime;
+            st->rtime = pp->rtime;
+            st->nswitch = pp->nswitch;
           }
           freeproc(pp);
           release(&pp->lock);
@@ -569,11 +651,123 @@ pick(void)
 }
 #endif
 
+#ifdef SCHEDULER_MLFQ
+// MLFQ: take the first process of the highest queue that has one. Returns the
+// process with its lock held, or 0 if none is RUNNABLE.
+static struct proc*
+pick(void)
+{
+  struct proc *p = 0;
+
+  acquire(&mq.lock);
+  for(int l = 0; l < NQUEUE && p == 0; l++){
+    if((p = mq.head[l]) != 0){
+      mq.head[l] = p->qnext;
+      if(mq.head[l] == 0)
+        mq.tail[l] = 0;
+      p->qnext = 0;
+    }
+  }
+  release(&mq.lock);
+  if(p == 0)
+    return 0;
+
+  // As in CFS: off the queue, it stays RUNNABLE and no other CPU can choose it,
+  // and if it has just yielded on another CPU this waits until that one is done.
+  acquire(&p->lock);
+  // The slice is not started afresh here: a process that a higher queue interrupted
+  // has only part of it used, and must go on from there. Otherwise a neighbour that
+  // wakes every tick, as a sleeper in pause() does, would keep it from ever sinking.
+  // A slice restarts when used up, on a boost, or on going to sleep.
+  acquire(&mq.lock);
+  p->on_cpu_since = r_time();
+  release(&mq.lock);
+  return p;
+}
+
+// Count the time since the last charge against this level. This is the clock and
+// not the tick count, because a tick only sees who is running when it arrives:
+// a process that always sleeps just before one is never seen at all.
+// Caller must hold p->lock.
+static void
+mlfq_charge(struct proc *p)
+{
+#if MLFQ_FAIR
+  uint64 now = r_time();
+
+  acquire(&mq.lock);
+  p->level_time += now - p->on_cpu_since;
+  p->on_cpu_since = now;
+  release(&mq.lock);
+#endif
+}
+
+// Every BOOST_TICKS, all processes go back to the top. Otherwise a stream of new
+// processes could keep the bottom queues from ever running, and a process that
+// has turned interactive could never climb back.
+static void
+mlfq_boost(void)
+{
+  acquire(&mq.lock);
+  for(int l = 1; l < NQUEUE; l++){
+    if(mq.head[l] == 0)
+      continue;
+    if(mq.tail[0])
+      mq.tail[0]->qnext = mq.head[l];
+    else
+      mq.head[0] = mq.head[l];
+    mq.tail[0] = mq.tail[l];
+    mq.head[l] = mq.tail[l] = 0;
+  }
+  for(struct proc *p = proc; p < &proc[NPROC]; p++){
+    p->level = 0;
+    p->level_time = 0;
+    p->slice_used = 0;
+  }
+  release(&mq.lock);
+}
+#endif
+
+// Called on CPU 0's timer interrupt, after the tick has been counted.
+void
+schedulertick(void)
+{
+#ifdef SCHEDULER_MLFQ
+  if(now() % BOOST_TICKS == 0)
+    mlfq_boost();
+#endif
+}
+
 // On a timer interrupt: should the running process give up the CPU?
 int
 preempt(void)
 {
-#if defined(SCHEDULER_FCFS)
+#if defined(SCHEDULER_MLFQ)
+  struct proc *p = myproc();
+  int expired, higher = 0;
+
+  acquire(&p->lock);
+  mlfq_charge(p);
+  acquire(&mq.lock);
+#if MLFQ_FAIR
+  expired = p->level_time >= (uint64)mlfq_slice[p->level] * CLOCK_PER_TICK;
+#else
+  expired = p->slice_used >= mlfq_slice[p->level];
+#endif
+  if(expired){
+    // used its whole slice: the next queue down, or the back of the lowest,
+    // which is what makes that one round robin
+    mq_demote(p);
+  } else {
+    // a process waiting in a higher queue takes over at this tick
+    for(int l = 0; l < p->level; l++)
+      if(mq.head[l])
+        higher = 1;
+  }
+  release(&mq.lock);
+  release(&p->lock);
+  return expired || higher;
+#elif defined(SCHEDULER_FCFS)
   // FCFS keeps a process on the CPU until it exits or sleeps.
   return 0;
 #elif defined(SCHEDULER_CFS)
@@ -614,7 +808,7 @@ scheduler(void)
     intr_on();
     intr_off();
 
-#if defined(SCHEDULER_FCFS) || defined(SCHEDULER_CFS)
+#if defined(SCHEDULER_FCFS) || defined(SCHEDULER_CFS) || defined(SCHEDULER_MLFQ)
     if((p = pick()) == 0){
       asm volatile("wfi");
       continue;
@@ -622,6 +816,9 @@ scheduler(void)
     // It is the process's job to release its lock and then reacquire
     // it before jumping back to us.
     p->state = RUNNING;
+    if(p->first_run < 0)
+      p->first_run = now();
+    p->nswitch++;
     c->proc = p;
     swtch(&c->context, &p->context);
     c->proc = 0;
@@ -637,6 +834,9 @@ scheduler(void)
         // to release its lock and then reacquire it
         // before jumping back to us.
         p->state = RUNNING;
+        if(p->first_run < 0)
+          p->first_run = now();
+        p->nswitch++;
         c->proc = p;
         swtch(&c->context, &p->context);
 
@@ -672,7 +872,50 @@ proctick(void)
   p->vruntime += VRT_TICK * 1024 / nice_weight[p->nice + 20];
   p->slice_used++;
 #endif
+#ifdef SCHEDULER_MLFQ
+  acquire(&mq.lock);
+  p->slice_used++;
+  release(&mq.lock);
+#endif
+  acquire(&trace.lock);
+  if(trace.on && trace.n < TRACE_MAX){
+    trace.ev[trace.n].tick = now();
+    trace.ev[trace.n].pid = p->pid;
+#ifdef SCHEDULER_MLFQ
+    trace.ev[trace.n].level = p->level;
+#else
+    trace.ev[trace.n].level = 0;
+#endif
+    trace.n++;
+  }
+  release(&trace.lock);
   release(&p->lock);
+}
+
+// schedtrace(0, 0) clears the record and starts it. schedtrace(buf, max) stops it
+// and copies out up to max events, returning how many.
+int
+kschedtrace(uint64 addr, int max)
+{
+  struct proc *p = myproc();
+  int n;
+
+  acquire(&trace.lock);
+  if(addr == 0){
+    trace.n = 0;
+    trace.on = 1;
+    release(&trace.lock);
+    return 0;
+  }
+  trace.on = 0;
+  n = trace.n < max ? trace.n : max;
+  release(&trace.lock);
+  // copyout can take its time, and the record cannot change while it is off
+  for(int i = 0; i < n; i++)
+    if(copyout(p->pagetable, addr + i * sizeof(struct schedevent),
+               (char *)&trace.ev[i], sizeof(struct schedevent)) < 0)
+      return -1;
+  return n;
 }
 
 // Switch to scheduler.  Must hold only p->lock
@@ -708,6 +951,9 @@ yield(void)
 {
   struct proc *p = myproc();
   acquire(&p->lock);
+#ifdef SCHEDULER_MLFQ
+  mlfq_charge(p);
+#endif
   setrunnable(p);
   sched();
   release(&p->lock);
@@ -767,6 +1013,13 @@ sleep(void *chan, struct spinlock *lk)
   acquire(&p->lock);  //DOC: sleeplock1
   release(lk);
 
+#ifdef SCHEDULER_MLFQ
+  mlfq_charge(p);
+  // the course's rule: giving up the CPU early keeps the level, with a new slice
+  acquire(&mq.lock);
+  p->slice_used = 0;
+  release(&mq.lock);
+#endif
   // Go to sleep.
   p->chan = chan;
   p->state = SLEEPING;
@@ -921,6 +1174,9 @@ procdump(void)
     printf("  ctime %u rtime %u nice %d", p->ctime, p->rtime, p->nice);
 #ifdef SCHEDULER_CFS
     printf(" vruntime %lu", p->vruntime);
+#endif
+#ifdef SCHEDULER_MLFQ
+    printf(" level %d", p->level);
 #endif
     printf("\n");
   }

@@ -27,6 +27,10 @@ int uptime(void);
 uint getreadcount(void);
 int waitx(int*, int*, int*);
 int setnice(int, int);
+struct procstat;
+struct schedevent;
+int waitstat(int*, struct procstat*);
+int schedtrace(struct schedevent*, int);
 
 // ulib.c
 int stat(const char*, struct stat*);

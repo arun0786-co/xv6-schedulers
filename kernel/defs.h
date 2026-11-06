@@ -8,6 +8,8 @@ struct spinlock;
 struct sleeplock;
 struct stat;
 struct superblock;
+struct procstat;
+struct schedevent;
 
 // bio.c
 void            binit(void);
@@ -87,6 +89,8 @@ pagetable_t     proc_pagetable(struct proc *);
 void            proc_freepagetable(pagetable_t, uint64);
 int             kkill(int);
 int             ksetnice(int, int);
+int             kschedtrace(uint64, int);
+void            schedulertick(void);
 int             killed(struct proc*);
 void            setkilled(struct proc*);
 struct cpu*     mycpu(void);
@@ -96,7 +100,7 @@ void            scheduler(void) __attribute__((noreturn));
 void            sched(void);
 void            sleep(void*, struct spinlock*);
 void            userinit(void);
-int             kwait(uint64, uint*, uint*);
+int             kwait(uint64, uint*, uint*, struct procstat*);
 void            wakeup(void*);
 void            yield(void);
 int             either_copyout(int user_dst, uint64 dst, void *src, uint64 len);

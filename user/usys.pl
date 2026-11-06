@@ -45,3 +45,5 @@ entry("uptime");
 entry("getreadcount");
 entry("waitx");
 entry("setnice");
+entry("waitstat");
+entry("schedtrace");

@@ -172,7 +172,10 @@ clockintr()
     wakeup(&ticks);
     release(&tickslock);
   }
+  // charge the tick first: a boost then starts the running process's turn afresh
   proctick();
+  if(cpuid() == 0)
+    schedulertick();
 
   // ask for the next timer interrupt. this also clears
   // the interrupt request. 1000000 is about a tenth

@@ -83,10 +83,15 @@ endif
 
 # Scheduling policy, chosen at build time: make qemu SCHEDULER=FCFS
 SCHEDULER ?= RR
-ifeq ($(filter $(SCHEDULER),RR FCFS CFS),)
-$(error SCHEDULER must be RR, FCFS or CFS)
+ifeq ($(filter $(SCHEDULER),RR FCFS CFS MLFQ),)
+$(error SCHEDULER must be RR, FCFS, CFS or MLFQ)
 endif
 CFLAGS += -DSCHEDULER_$(SCHEDULER)
+
+# MLFQ_FAIR=1 charges a process for the real time it uses at a level, however
+# often it sleeps. See mlfq_charge() in kernel/proc.c.
+MLFQ_FAIR ?= 0
+CFLAGS += -DMLFQ_FAIR=$(MLFQ_FAIR)
 
 # CFS prints the run queue before every decision; make CFSLOG=0 turns it off.
 CFSLOG ?= 1
@@ -101,7 +106,7 @@ endif
 # Make cannot see a change in compiler flags, so the kernel options are kept
 # in a file that is rewritten only when they change, and every kernel object
 # depends on that file.
-KOPTS = $(SCHEDULER) $(CFSLOG) $(READCOUNT_START)
+KOPTS = $(SCHEDULER) $(CFSLOG) $(READCOUNT_START) $(MLFQ_FAIR)
 $K/kernel.options: FORCE
 	@echo '$(KOPTS)' | cmp -s - $@ || echo '$(KOPTS)' > $@
 $(OBJS): $K/kernel.options
@@ -172,6 +177,8 @@ UPROGS=\
 	$U/_readrace\
 	$U/_schedulertest\
 	$U/_nicetest\
+	$U/_mlfqtest\
+	$U/_schedbench\
 
 fs.img: mkfs/mkfs README $(UPROGS)
 	mkfs/mkfs fs.img README $(UPROGS)

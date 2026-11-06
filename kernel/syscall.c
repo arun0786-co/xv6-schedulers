@@ -104,6 +104,8 @@ extern uint64 sys_close(void);
 extern uint64 sys_getreadcount(void);
 extern uint64 sys_waitx(void);
 extern uint64 sys_setnice(void);
+extern uint64 sys_waitstat(void);
+extern uint64 sys_schedtrace(void);
 
 // An array mapping syscall numbers from syscall.h
 // to the function that handles the system call.
@@ -132,6 +134,8 @@ static uint64 (*syscalls[])(void) = {
 [SYS_getreadcount] sys_getreadcount,
 [SYS_waitx]   sys_waitx,
 [SYS_setnice] sys_setnice,
+[SYS_waitstat] sys_waitstat,
+[SYS_schedtrace] sys_schedtrace,
 };
 
 void

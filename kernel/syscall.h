@@ -23,3 +23,5 @@
 #define SYS_getreadcount 22
 #define SYS_waitx  23
 #define SYS_setnice 24
+#define SYS_waitstat 25
+#define SYS_schedtrace 26

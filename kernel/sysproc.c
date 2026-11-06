@@ -5,6 +5,7 @@
 #include "memlayout.h"
 #include "spinlock.h"
 #include "proc.h"
+#include "schedstat.h"
 #include "vm.h"
 
 uint64
@@ -33,7 +34,7 @@ sys_wait(void)
 {
   uint64 p;
   argaddr(0, &p);
-  return kwait(p, 0, 0);
+  return kwait(p, 0, 0, 0);
 }
 
 // waitx(int *status, int *wtime, int *rtime): wait() that also reports how
@@ -50,12 +51,42 @@ sys_waitx(void)
   argaddr(0, &addr);
   argaddr(1, &waddr);
   argaddr(2, &raddr);
-  if((pid = kwait(addr, &rtime, &wtime)) < 0)
+  if((pid = kwait(addr, &rtime, &wtime, 0)) < 0)
     return -1;
   if(copyout(p->pagetable, waddr, (char *)&wtime, sizeof(wtime)) < 0 ||
      copyout(p->pagetable, raddr, (char *)&rtime, sizeof(rtime)) < 0)
     return -1;
   return pid;
+}
+
+// waitstat(int *status, struct procstat *st): wait() that also reports all the
+// kernel knows about how the child was scheduled.
+uint64
+sys_waitstat(void)
+{
+  uint64 addr, saddr;
+  struct procstat st;
+  int pid;
+
+  argaddr(0, &addr);
+  argaddr(1, &saddr);
+  if((pid = kwait(addr, 0, 0, &st)) < 0)
+    return -1;
+  if(copyout(myproc()->pagetable, saddr, (char *)&st, sizeof(st)) < 0)
+    return -1;
+  return pid;
+}
+
+// schedtrace(struct schedevent *buf, int max): see kschedtrace().
+uint64
+sys_schedtrace(void)
+{
+  uint64 addr;
+  int max;
+
+  argaddr(0, &addr);
+  argint(1, &max);
+  return kschedtrace(addr, max);
 }
 
 uint64
