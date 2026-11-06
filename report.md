@@ -1,13 +1,10 @@
-# xv6: getreadcount, FCFS and CFS
+# xv6: getreadcount, FCFS, CFS and MLFQ
 
-`xv6_modifications.patch` applies to
-[mit-pdos/xv6-riscv](https://github.com/mit-pdos/xv6-riscv) at commit
-`9dbd536` (10 September 2025):
+This tree is [mit-pdos/xv6-riscv](https://github.com/mit-pdos/xv6-riscv) at commit
+`9dbd536` (10 September 2025), which is the commit `import xv6-riscv at 9dbd536`
+here, with these changes on top:
 
 ```
-git clone https://github.com/mit-pdos/xv6-riscv && cd xv6-riscv
-git checkout 9dbd536
-git apply ../xv6_modifications.patch
 make qemu SCHEDULER=CFS CPUS=1
 ```
 
@@ -15,7 +12,8 @@ Build options:
 
 | Option | Values | Effect |
 |---|---|---|
-| `SCHEDULER` | `RR` (default), `FCFS`, `CFS` | scheduling policy; any other value is an error |
+| `SCHEDULER` | `RR` (default), `FCFS`, `CFS`, `MLFQ` | scheduling policy; any other value is an error |
+| `MLFQ_FAIR` | `0` (default), `1` | MLFQ charges real time used at a level, not ticks that land on it |
 | `CPUS` | 1 to 8, default 3 | number of CPUs qemu gives xv6 |
 | `CFSLOG` | `1` (default), `0` | CFS prints its run queue before every decision |
 | `READCOUNT_START` | a number | starting value of the read counter, to test the wrap-around |
@@ -25,8 +23,8 @@ Makefile writes them to `kernel/kernel.options` and rebuilds the kernel
 whenever they differ from the last build. `make clean` between policies is
 not needed.
 
-New user programs: `readcount`, `readrace`, `schedulertest`, `nicetest`.
-New system calls: `getreadcount`, `waitx`, `setnice`.
+New user programs: `readcount`, `readrace`, `schedulertest`, `nicetest`, `mlfqtest`, `schedbench`.
+New system calls: `getreadcount`, `waitx`, `setnice`, `waitstat`, `schedtrace`.
 
 ## Part A: getreadcount
 
@@ -171,79 +169,38 @@ nice 5: weight 335, expected 24%, got 24% (24 ticks)
 nicetest: OK
 ```
 
+### MLFQ
+
+The bonus part. There are four queues with slices of 1, 4, 8 and 16 ticks, held in `mq` in `proc.c`. `setrunnable` appends a process to the queue of its level, and `pick` takes the front of the highest non-empty one.
+
+- **New processes** start at level 0 (`allocproc`).
+- **A used slice:** `preempt` runs on each timer interrupt. If the slice is used it calls `mq_demote` and the process yields, so it goes to the back of the next queue down, or of the lowest, which is what makes that one round robin.
+- **A higher queue:** `preempt` also looks for work in any higher queue, and yields if there is some, so that takes over at the next tick. The spec does not say where the interrupted process goes; here it goes to the back of its own queue, and keeps what it has used of its slice.
+- **Sleeping:** the level stays, and the slice starts afresh when it wakes, as the spec says.
+- **The boost:** every 48 ticks on CPU 0, `mlfq_boost` moves all the queues onto queue 0 and sets every process to level 0. The tick is charged first, so a boost starts the running process's turn afresh.
+
+A bug worth recording: at first `pick` restarted the slice each time, so a process interrupted by a higher queue came back with a whole new slice. xv6 wakes every sleeper in `pause()` on every tick, so a single sleeping neighbour kept a CPU-bound process at level 1 for 29 ticks instead of 4. `tests/mlfqcheck.py` found it from the kernel's trace.
+
 ## Performance comparison
 
-`schedulertest`, 3 runs per policy, on qemu 10.1 on an Apple silicon Mac,
-CFS built with `CFSLOG=0`. A tick is 100 ms of wall-clock time. Times are
-averages over the 10 children, in ticks.
-
-One CPU (`CPUS=1`), as the spec asks:
+`schedulertest` on one CPU, as the spec asks, on qemu 10.0 in a Linux container on an Apple silicon Mac, with CFS built with `CFSLOG=0`. The medians of 3 runs are below. A tick is 100 ms of wall-clock time, and times are averages over the 10 children, in ticks. `tools/compare.py` prints this table.
 
 | Policy | Average rtime | Average wtime |
 |---|---|---|
-| Round robin | 22, 22, 22 | 188, 190, 189 |
-| FCFS | 22, 22, 22 | 155, 159, 158 |
-| CFS | 22, 22, 22 | 186, 189, 189 |
+| Round robin | 14 | 156 |
+| FCFS | 15 | 131 |
+| CFS | 14 | 152 |
+| MLFQ | 14 | 157 |
 
-Each child, first run (children 0 to 4 sleep, 5 to 9 spin):
+Each spinner runs for about the same time under every policy, so the averages differ only in waiting:
 
-| Child | RR wtime | FCFS wtime | CFS wtime |
-|---|---|---|---|
-| 0 to 4 (sleep) | 200 each | 222 each | 204 each |
-| 5 | 177 | 0 | 160 |
-| 6 | 177 | 44 | 164 |
-| 7 | 177 | 88 | 169 |
-| 8 | 178 | 132 | 173 |
-| 9 | 177 | 177 | 179 |
+- **Round robin** switches every tick, so the five spinners finish together at the very end, and each waits about 4 times its own run time. A sleeper gets the CPU within a tick of waking.
+- **FCFS** runs the spinners one after another, so most finish much earlier and the average is the lowest. The cost shows in the sleepers, which wake while a spinner is running and must wait until it finishes. On an interactive system that wait has no bound; a long job would freeze the shell.
+- **CFS** shares the CPU like round robin, in slices of several ticks.
+- **MLFQ** comes out like round robin here, because every process is in the same position: all five spinners sink together and share the bottom queue, and boosts bring them back together. Where processes differ, it does not behave like round robin at all, which `schedulertest` cannot show.
 
-Each spinner runs for about 44 ticks under every policy, so the averages
-differ only in waiting:
-
-- **Round robin** switches every tick, so the five spinners finish together
-  at the very end and each waits about 4 times its own run time. A sleeper
-  gets the CPU within a tick of waking, so its `wtime` is just its 200-tick
-  sleep.
-- **FCFS** runs the spinners one after another: child 5 waits 0 ticks,
-  child 6 waits for child 5, and so on. Most of them finish much earlier
-  than under round robin, so the average is the lowest of the three. The
-  cost shows in the sleepers: they wake at tick 200 while child 9 is
-  running and must wait until it finishes at 222. On an interactive system
-  that wait has no bound; a long job would freeze the shell.
-- **CFS** shares the CPU like round robin, so its average is close, but in
-  slices of several ticks (48 divided by the number of RUNNABLE processes)
-  instead of 1, so the spinners finish a slice or so apart. A sleeper that
-  wakes waits for the current slice to end (204).
-
-Three CPUs (`CPUS=3`), for comparison:
-
-| Policy | Average rtime | Average wtime |
-|---|---|---|
-| Round robin | 30, 28, 29 | 119, 118, 119 |
-| FCFS | 30, 27, 29 | 113, 112, 112 |
-| CFS | 30, 28, 28 | 119, 118, 118 |
-
-With 5 spinners on 3 CPUs there is less waiting under every policy. The
-3-CPU runs of the three policies ran on the host at the same time, so each
-virtual CPU was slower: a spinner took 48 to 70 ticks instead of about 45.
+So `schedbench` mixes long jobs, short jobs that arrive later, and interactive processes. `README.md` has that table and what it shows.
 
 ## Testing
 
-`python3 test.py` clones xv6, applies the patch, and builds and boots each
-policy in qemu. It checks:
-
-- `readcount`, `readrace` on 3 CPUs, and the wrap-around
-- that the spinners share the CPU under round robin and CFS, and run one
-  after another under FCFS
-- that under FCFS a process that wakes up waits for the running one
-- the `nicetest` shares
-- every block of the CFS log: well formed, the queue sorted by `vruntime`,
-  the first process chosen, and `vruntime` growing
-
-It passes on Linux. Two deliberately broken kernels fail it: FCFS that
-preempts every tick, and CFS whose `vruntime` never grows.
-
-xv6's own `usertests -q` passes on 3 CPUs under round robin and CFS. Under
-FCFS every test passes when run on its own except `preempt`, which never
-finishes. That test starts processes that spin forever on all three CPUs and
-then needs a CPU to kill them, which a non-preemptive scheduler never gives
-it.
+`python3 tests/run.py` builds and boots each policy and checks what the test programs print. For CFS it replays the log. For MLFQ, `tests/mlfqcheck.py` checks the rules against the kernel's tick trace.
